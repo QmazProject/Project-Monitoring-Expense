@@ -1,0 +1,30 @@
+{
+  "name": "project-expense-monitoring",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Project Expense Monitoring: React + Vite front end on Supabase, deployed on Vercel.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "db:push": "supabase db push",
+    "functions:deploy": "supabase functions deploy oe-invite-user",
+    "bootstrap:users": "node scripts/bootstrap-users.mjs",
+    "test:smoke": "npm run build && node scripts/smoke-test.mjs dist demo"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
+    "@vercel/edge": "^1.2.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.1",
+    "jsdom": "^29.1.1",
+    "vite": "^8.3.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

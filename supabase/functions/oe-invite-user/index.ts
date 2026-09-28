@@ -1,0 +1,84 @@
+/* oe-invite-user: invites a new person by email and assigns their role.
+   Called from Settings → Users in the app (api.inviteUser). Only a signed-in user whose role
+   has the "settings.users" permission may call it; the check runs in the database (oe_has_perm)
+   with the caller's own token, so it follows whatever Access rights say.
+
+   Deploy:  supabase functions deploy oe-invite-user
+   Secrets: uses the project's built-in SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY. */
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
+  if (req.method !== "POST") return json({ error: "Method not allowed." }, 405);
+
+  const authHeader = req.headers.get("Authorization") || "";
+  if (!authHeader.startsWith("Bearer ")) return json({ error: "Sign in first." }, 401);
+
+  const url = Deno.env.get("SUPABASE_URL");
+  const anonKey = Deno.env.get("SUPABASE_ANON_KEY");
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!url || !anonKey || !serviceKey) return json({ error: "Function is not configured." }, 500);
+
+  // 1. Who is calling, and may they manage users? (evaluated as the caller, under RLS)
+  const asCaller = createClient(url, anonKey, {
+    global: { headers: { Authorization: authHeader } },
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  const { data: userData, error: userErr } = await asCaller.auth.getUser();
+  if (userErr || !userData?.user) return json({ error: "Your session has ended. Sign in again." }, 401);
+
+  const { data: allowed, error: permErr } = await asCaller.rpc("oe_has_perm", { p: "settings.users" });
+  if (permErr || allowed !== true) return json({ error: "Your role can't invite users." }, 403);
+
+  // 2. Validate the request body
+  let body: Record<string, unknown> | null = null;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "Invalid request." }, 400);
+  }
+  const email = String(body?.email ?? "").trim().toLowerCase();
+  const fullName = String(body?.full_name ?? "").trim().slice(0, 120);
+  const role = String(body?.role ?? "").trim();
+  const redirectTo = typeof body?.redirect_to === "string" ? body.redirect_to : undefined;
+
+  if (!EMAIL_RE.test(email) || email.length > 254) return json({ error: "Enter a valid email address." }, 400);
+  if (!fullName) return json({ error: "Enter the person's name." }, 400);
+  if (!role) return json({ error: "Choose a role." }, 400);
+  if (redirectTo && !/^https?:\/\//.test(redirectTo)) return json({ error: "Invalid redirect address." }, 400);
+
+  // 3. Do the privileged work with the service role
+  const admin = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
+
+  const { data: roleRow, error: roleErr } = await admin.from("oe_role_permissions").select("role").eq("role", role).maybeSingle();
+  if (roleErr) return json({ error: roleErr.message }, 500);
+  if (!roleRow) return json({ error: "That role doesn't exist." }, 400);
+
+  const { data: existing } = await admin.from("oe_profiles").select("id").ilike("email", email).maybeSingle();
+  if (existing) return json({ error: "That email already has an account. Edit it in the user list instead." }, 409);
+
+  const { data: invited, error: inviteErr } = await admin.auth.admin.inviteUserByEmail(email, {
+    data: { full_name: fullName },
+    redirectTo,
+  });
+  if (inviteErr || !invited?.user) return json({ error: inviteErr?.message || "The invite couldn't be sent." }, 400);
+
+  // The auth trigger already created the profile row; set the details the administrator chose.
+  const { error: profErr } = await admin
+    .from("oe_profiles")
+    .upsert({ id: invited.user.id, email, full_name: fullName, role, is_active: true });
+  if (profErr) return json({ error: `Invited, but the role could not be saved: ${profErr.message}` }, 500);
+
+  return json({ ok: true, id: invited.user.id });
+});

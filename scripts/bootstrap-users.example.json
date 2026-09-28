@@ -1,0 +1,6 @@
+[
+  { "email": "admin@yourcompany.com",      "password": "ChangeMe-Admin-2026!",      "full_name": "System Administrator", "role": "admin" },
+  { "email": "management@yourcompany.com", "password": "ChangeMe-TM-2026!",         "full_name": "Top Management",       "role": "tm" },
+  { "email": "accounting@yourcompany.com", "password": "ChangeMe-Accounting-2026!", "full_name": "Accounting Officer",   "role": "accounting" },
+  { "email": "liaison@yourcompany.com",    "password": "ChangeMe-Liaison-2026!",    "full_name": "Liaison Officer",      "role": "liaison" }
+]
