@@ -851,7 +851,6 @@ function createDemoApi() {
       return { id: p.id };
     },
     async signOut() { me = null; },
-    async resetPassword() { throw new Error("Password reset isn't available in demo mode."); },
     async updatePassword() {},
     async getProfile() { return clone(profile() || null); },
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
@@ -1288,12 +1287,6 @@ function createSupabaseApi() {
       const client = await sb();
       await client.auth.signOut();
       userId = null;
-    },
-    async resetPassword(identifier) {
-      const email = loginEmail(identifier);
-      if (!email) throw new Error("Enter your full email address to reset your password.");
-      const client = await sb();
-      await ok(client.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin + window.location.pathname }));
     },
     async updatePassword(password) {
       const client = await sb();
@@ -8259,15 +8252,8 @@ function Login({ api, onDone, onSwitchMode }) {
       setBusy(false);
     }
   };
-  const forgot = async () => {
-    if (!f.user.trim()) return setMsg({ tone: "warn", text: "Enter your username first, then choose Forgot password." });
-    try {
-      await api.resetPassword(f.user);
-      setMsg({ tone: "info", text: "If that account exists, a reset link is on its way to its email." });
-    } catch (err) {
-      setMsg({ tone: "bad", text: err.message });
-    }
-  };
+  // No self-service password reset: a forgotten password is changed by the administrator
+  // (Supabase SQL Editor: select oe_set_login_password('email', 'new password')).
   return (
     <SignInFrame>
         {demo ? (
@@ -8352,9 +8338,6 @@ function Login({ api, onDone, onSwitchMode }) {
             {msg && <Note tone={msg.tone}>{msg.text}</Note>}
             <Button variant="primary" busy={busy} onClick={submit}>
               Sign in
-            </Button>
-            <Button variant="ghost" onClick={forgot}>
-              Forgot password
             </Button>
             {onSwitchMode && DEMO_ENABLED && (
               <>

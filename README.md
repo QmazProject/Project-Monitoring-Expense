@@ -20,6 +20,7 @@ Two ways in, both on the same sign-in page:
 | `src/main.jsx`, `index.html` | Vite entry point (tab title stays "Sign in" until someone signs in) |
 | `supabase/migrations/20260928000000_oe_schema.sql` | Full schema: tables, RLS, workflow functions, seeds (idempotent) |
 | `supabase/migrations/20260928000001_oe_bootstrap_accounts.sql` | Developer-only functions to create the first accounts, plus extra grants hardening |
+| `supabase/migrations/20260928000002_oe_live_starts_empty.sql` | Removes the sample projects once so live starts empty |
 | `supabase/bootstrap_accounts.sql` | Template you run once in the SQL Editor to create admin / top management / accounting / liaison |
 | `supabase/functions/oe-invite-user/` | Edge Function used by Settings → Users to invite people (checks the caller's permission in the database) |
 | `scripts/bootstrap-users.mjs` | Terminal alternative to the SQL template, using the Auth admin API |
@@ -55,6 +56,8 @@ Withdrawn, Returned and Reclassified as side exits. `docs/SETUP.md` explains eac
 - [x] `oe-invite-user` Edge Function (was referenced by the app but missing)
 - [x] Vercel security headers, edge middleware, sign-ups disabled in Supabase config
 - [x] Captcha (Cloudflare Turnstile) wired but off until a site key is set
+- [x] Forgot-password removed from the sign-in page; resets are done by the administrator in SQL
+- [x] Live starts with an empty project listing (migration 0002)
 
 ### Phase 1. Supabase project
 1. Create a project at supabase.com (or use an existing one; every object is prefixed `oe_`).
@@ -126,6 +129,53 @@ Later:
 - **Vercel Firewall**: Project → Firewall → turn on *Attack Challenge Mode* during an attack, add IP / country rules,
   and (Pro plan) rate-limit rules that are enforced across all edge regions rather than per isolate.
 - **Custom SMTP** in Supabase for invites and password resets (the built-in sender is limited to a few emails per hour).
+
+## Where the data lives (Supabase)
+
+Everything the live system stores is in your Supabase project. Nothing is kept in the browser except the
+signed-in session. Demo mode never touches Supabase: its sample data is built in memory and resets on reload.
+
+| Table / object | Holds | Written by |
+|---|---|---|
+| `auth.users` (Supabase Auth) | Sign-ins: email, password hash, confirmation | Developer bootstrap, invite function |
+| `oe_profiles` | One row per user: full name, role, active flag | Auth trigger, admin (Settings → Users), bootstrap |
+| `oe_role_permissions` | Roles and the permission keys each one has | Admin (Settings → Access rights) |
+| `oe_settings` | One row: reference prefix, close policy, near-limit %, idle minutes, form title, upgrade flags | Admin (Settings → System) |
+| `oe_projects` | Project listing (code, district, contract value, dates, status, accomplishment) plus the internal buckets ADVANCES and FOR-ASSIGNMENT | Users with *Add and edit projects* |
+| `oe_project_allocations` | Per-project overrides of the allocation for an expense type | Users with *Set project allocations* |
+| `oe_expense_categories` | Bidding, Collection, Support, Inspection, Testing (and the supporting-document rule) | Settings → Expense categories |
+| `oe_expense_types` | Expense types under each category with calc method, rate, fixed allocation, ERP account | Settings → Expense categories |
+| `oe_district_rates` | SOP rate overrides per district and expense type | Settings → Expense categories |
+| `oe_counters` | Reference-number sequence per prefix and year | `oe_create_request` only |
+| `oe_requests` | Request header: reference no., dates, project, liaison, status, approval / ERP / disbursement stamps | Workflow functions only |
+| `oe_request_lines` | Each line: project, expense type, amount, approved amount, paid / returned amounts, line status | Workflow functions only |
+| `oe_request_events` | Full history log of every action on a request | Workflow functions only |
+| `oe_line_reclass` | Splits of FOR-ASSIGNMENT / ADVANCES lines to real projects | `oe_reclassify_line` |
+| `oe_line_returns` | Each fund return: amount, date, receipt no., reason, who recorded it | `oe_return_line` |
+| `oe_line_documents` | Metadata of attached files (path, name, size, type) | `oe_create_request`, `oe_add_line_documents` |
+| Storage bucket `oe-documents` (private) | The attached PDF / image files, one folder per uploader | Liaison uploads; read through signed links |
+
+Pages map onto these as follows: **Project listing** and **Project report** read `oe_projects`, allocations, types
+and the request lines; **New request / Approvals / Request list** read and write requests, lines, events, returns,
+reclass and documents through the `oe_*` SQL functions; **Analysis** reads requests, lines and events; **Settings**
+edits profiles, roles, settings, categories, types and rates. Row Level Security decides who can read which rows,
+and the request tables accept no direct writes from the app at all.
+
+A brand-new live system starts with an empty project listing (the sample projects from the original sheet are
+removed by the third migration; the two internal buckets stay), the default categories, types and rates, and no
+requests. Add projects in **Project listing → Add project**.
+
+## Passwords
+
+There is no "Forgot password" on the sign-in page and no self-service reset. When someone forgets their
+password, an administrator sets a new one in Supabase → SQL Editor:
+
+```sql
+select oe_set_login_password('person@yourcompany.com', 'NewStrongPassword!');
+```
+
+(Authentication → Users → *Reset password* in the Supabase dashboard also works.) The set-password screen the
+app still has is only reached from an invite link, so invited people can choose their first password.
 
 ## Environment variables
 

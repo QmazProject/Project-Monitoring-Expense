@@ -11,7 +11,7 @@
     "db:push": "supabase db push",
     "functions:deploy": "supabase functions deploy oe-invite-user",
     "bootstrap:users": "node scripts/bootstrap-users.mjs",
-    "test:smoke": "npm run build && node scripts/smoke-test.mjs dist demo"
+    "test:smoke": "VITE_SUPABASE_URL= VITE_SUPABASE_ANON_KEY= vite build --outDir dist-smoke && node scripts/smoke-test.mjs dist-smoke demo"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.2",
