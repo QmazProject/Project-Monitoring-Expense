@@ -6,7 +6,6 @@
      and run supabase_schema.sql in your Supabase project first.
    ===================================================================== */
 import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef, createContext, useContext } from "react";
-import { createClient } from "@supabase/supabase-js";
 
 /* ---------------------------------------------------------------------
    1. CONFIG
@@ -15,17 +14,15 @@ import { createClient } from "@supabase/supabase-js";
    functions. Never put the service_role key here.
    --------------------------------------------------------------------- */
 const CONFIG = {
-  // Filled from .env by src/env.js (VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY, ...).
-  // The values here are only the defaults used when nothing is set.
   supabaseUrl: "",       // e.g. "https://abcdxyz.supabase.co"
   supabaseAnonKey: "",   // Supabase → Project Settings → API → anon public key
+  // Loaded at runtime so this file has no npm dependency. To bundle it instead,
+  // install the supabase-js package and import createClient from it in
+  // loadSupabase() (see the note there).
   // Optional company email domain, e.g. "example.com.ph". When set, people sign in
   // with just their username (the part before @); a full email always works too.
   usernameDomain: "",
-  // Offer "Try the demo" on the sign-in page beside the live sign-in form.
-  demoEnabled: true,
-  // Cloudflare Turnstile site key. Empty until captcha is switched on in Supabase (Auth → Attack protection).
-  captchaSiteKey: "",
+  supabaseJsUrl: "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.0/+esm",
   // Excel export (loaded only when someone exports). Pinned version with an integrity
   // check: the browser refuses the file if it ever differs from this exact release.
   excelJsUrl: "https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js",
@@ -33,8 +30,6 @@ const CONFIG = {
   ...(typeof globalThis !== "undefined" && globalThis.OE_CONFIG ? globalThis.OE_CONFIG : {}),
 };
 const LIVE = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseAnonKey);
-// Without keys the demo is the only mode; with keys it is an option on the sign-in page unless switched off.
-const DEMO_ENABLED = !LIVE || CONFIG.demoEnabled !== false;
 const INITIAL_HASH = typeof window !== "undefined" ? window.location.hash : "";
 const NEEDS_PASSWORD = /type=(invite|recovery)/.test(INITIAL_HASH);
 
@@ -879,6 +874,7 @@ function createDemoApi() {
       return { id: p.id };
     },
     async signOut() { me = null; },
+    async resetPassword() { throw new Error("Password reset isn't available in demo mode."); },
     async updatePassword() {},
     async getProfile() { return clone(profile() || null); },
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
@@ -1284,10 +1280,12 @@ function createDemoApi() {
 }
 
 let _sbPromise = null;
-// supabase-js is bundled by Vite from the npm package, so nothing is fetched from a CDN at runtime.
+// Indirect import so preview tools and bundlers don't try to resolve the CDN URL.
+// With the npm package installed you can replace importUrl(...) with the package import.
+const importUrl = (u) => new Function("u", "return import(u)")(u);
 function loadSupabase() {
   if (!_sbPromise)
-    _sbPromise = Promise.resolve(
+    _sbPromise = importUrl(CONFIG.supabaseJsUrl).then(({ createClient }) =>
       createClient(CONFIG.supabaseUrl, CONFIG.supabaseAnonKey, {
         auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
       })
@@ -1322,12 +1320,11 @@ function createSupabaseApi() {
       });
       return () => sub && sub.unsubscribe();
     },
-    async signIn(identifier, password, captchaToken) {
+    async signIn(identifier, password) {
       const email = loginEmail(identifier);
       if (!email) throw new Error("Enter your full email address as the username.");
       const client = await sb();
-      // captchaToken is only present once Turnstile is configured (CONFIG.captchaSiteKey + Supabase Attack protection).
-      const data = await ok(client.auth.signInWithPassword({ email, password, ...(captchaToken ? { options: { captchaToken } } : {}) }));
+      const data = await ok(client.auth.signInWithPassword({ email, password }));
       userId = data.user.id;
       return data.user;
     },
@@ -1335,6 +1332,12 @@ function createSupabaseApi() {
       const client = await sb();
       await client.auth.signOut();
       userId = null;
+    },
+    async resetPassword(identifier) {
+      const email = loginEmail(identifier);
+      if (!email) throw new Error("Enter your full email address to reset your password.");
+      const client = await sb();
+      await ok(client.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin + window.location.pathname }));
     },
     async updatePassword(password) {
       const client = await sb();
@@ -1873,10 +1876,6 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 @keyframes oe-topo-in{from{opacity:0;transform:scale(1.035)}to{opacity:1;transform:none}}
 .oe-signin-card{grid-column:1;position:relative;background:var(--surface);color:var(--body);border-radius:20px;padding:34px 34px 30px;box-shadow:0 32px 80px rgba(0,12,22,.5),0 0 0 1px rgba(255,255,255,.07);animation:oe-pop .5s .2s ease-out both}
 .oe-signin-card .oe-login-card{display:flex;flex-direction:column;gap:16px}
-.oe-login-or{display:flex;align-items:center;gap:10px;color:var(--faint);font-size:12px;text-transform:uppercase;letter-spacing:.06em}
-.oe-login-or::before,.oe-login-or::after{content:"";flex:1;height:1px;background:var(--line)}
-.oe-captcha{min-height:65px;display:flex;justify-content:center}
-.oe-captcha:empty{display:none}
 .oe-signin-card h2{font-size:24px;letter-spacing:-.015em}
 .oe-signin-mark{display:block;margin-bottom:20px}
 .oe-signin-mark rect{fill:var(--teal-50)}
@@ -8405,84 +8404,35 @@ function SignInFrame({ children }) {
   );
 }
 
-/* Cloudflare Turnstile (captcha). Only rendered when CONFIG.captchaSiteKey is set, so nothing is
-   loaded from Cloudflare until captcha is switched on in Supabase → Auth → Attack protection. */
-let turnstilePromise = null;
-function loadTurnstile() {
-  if (!turnstilePromise)
-    turnstilePromise = new Promise((resolve, reject) => {
-      if (window.turnstile) return resolve(window.turnstile);
-      const s = document.createElement("script");
-      s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
-      s.async = true;
-      s.onload = () => resolve(window.turnstile);
-      s.onerror = () => {
-        turnstilePromise = null;
-        reject(new Error("The verification widget couldn't be loaded."));
-      };
-      document.head.appendChild(s);
-    });
-  return turnstilePromise;
-}
-
-function Captcha({ siteKey, onToken, resetKey }) {
-  const box = useRef(null);
-  const widget = useRef(null);
-  useEffect(() => {
-    let alive = true;
-    loadTurnstile()
-      .then((ts) => {
-        if (!alive || !box.current) return;
-        widget.current = ts.render(box.current, {
-          sitekey: siteKey,
-          callback: (token) => onToken(token),
-          "expired-callback": () => onToken(null),
-          "error-callback": () => onToken(null),
-        });
-      })
-      .catch(() => onToken(null));
-    return () => {
-      alive = false;
-      if (widget.current && window.turnstile) window.turnstile.remove(widget.current);
-      widget.current = null;
-    };
-  }, [siteKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    if (resetKey && widget.current && window.turnstile) window.turnstile.reset(widget.current);
-  }, [resetKey]);
-  return <div ref={box} className="oe-captcha" />;
-}
-
-function Login({ api, onDone, onSwitchMode }) {
+function Login({ api, onDone }) {
   const [f, setF] = useState({ user: "", password: "" });
   const [show, setShow] = useState(false);
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
   const demo = api.mode === "demo";
-  const captchaOn = !demo && Boolean(CONFIG.captchaSiteKey);
-  const [captcha, setCaptcha] = useState(null);
-  const [captchaReset, setCaptchaReset] = useState(0);
   const submit = async (e) => {
     if (e && e.preventDefault) e.preventDefault();
     if (busy) return;
     if (!f.user.trim() || !f.password) return setMsg({ tone: "warn", text: "Enter your username and password." });
-    if (captchaOn && !captcha) return setMsg({ tone: "warn", text: "Complete the verification first." });
     setBusy(true);
     setMsg(null);
     try {
-      await api.signIn(f.user, f.password, captchaOn ? captcha : undefined);
+      await api.signIn(f.user, f.password);
       await onDone();
     } catch (err) {
       setMsg({ tone: "bad", text: /invalid/i.test(err.message) ? "Username or password is incorrect." : err.message });
-      if (captchaOn) {
-        setCaptcha(null);
-        setCaptchaReset((n) => n + 1);
-      }
       setBusy(false);
     }
   };
-  // No self-service password reset: a forgotten password is changed by the administrator
-  // (Supabase SQL Editor: select oe_set_login_password('email', 'new password')).
+  const forgot = async () => {
+    if (!f.user.trim()) return setMsg({ tone: "warn", text: "Enter your username first, then choose Forgot password." });
+    try {
+      await api.resetPassword(f.user);
+      setMsg({ tone: "info", text: "If that account exists, a reset link is on its way to its email." });
+    } catch (err) {
+      setMsg({ tone: "bad", text: err.message });
+    }
+  };
   return (
     <SignInFrame>
         {demo ? (
@@ -8522,11 +8472,6 @@ function Login({ api, onDone, onSwitchMode }) {
               ))}
             </div>
             {msg && <Note tone={msg.tone}>{msg.text}</Note>}
-            {onSwitchMode && LIVE && (
-              <Button variant="ghost" icon="lock" disabled={busy} onClick={() => onSwitchMode("live")}>
-                Sign in with your account
-              </Button>
-            )}
           </div>
         ) : (
           <div className="oe-login-card" onKeyDown={(e) => e.key === "Enter" && e.target.tagName === "INPUT" && submit(e)}>
@@ -8563,21 +8508,13 @@ function Login({ api, onDone, onSwitchMode }) {
                 </button>
               </div>
             </Field>
-            {captchaOn && <Captcha siteKey={CONFIG.captchaSiteKey} onToken={setCaptcha} resetKey={captchaReset} />}
             {msg && <Note tone={msg.tone}>{msg.text}</Note>}
             <Button variant="primary" busy={busy} onClick={submit}>
               Sign in
             </Button>
-            {onSwitchMode && DEMO_ENABLED && (
-              <>
-                <div className="oe-login-or">
-                  <span>or</span>
-                </div>
-                <Button variant="ghost" disabled={busy} onClick={() => onSwitchMode("demo")}>
-                  Try the demo with sample data
-                </Button>
-              </>
-            )}
+            <Button variant="ghost" onClick={forgot}>
+              Forgot password
+            </Button>
           </div>
         )}
     </SignInFrame>
@@ -8642,16 +8579,8 @@ const NAV = [
 
 function Root() {
   const ui = useUI();
-  // Live (Supabase) whenever keys are configured; the demo stays reachable from the sign-in page.
-  const [mode, setMode] = useState(LIVE ? "live" : "demo");
-  const api = useMemo(() => (mode === "live" ? createSupabaseApi() : createDemoApi()), [mode]);
+  const api = useMemo(() => (LIVE ? createSupabaseApi() : createDemoApi()), []);
   const [auth, setAuth] = useState({ status: "loading" });
-  const switchMode = useCallback((m) => {
-    if (m === "live" && !LIVE) return;
-    if (m === "demo" && !DEMO_ENABLED) return;
-    setAuth({ status: "loading" });
-    setMode(m);
-  }, []);
   const [profile, setProfile] = useState(null);
   const [data, setData] = useState(null);
   const [page, setPage] = useState(null);
@@ -8684,8 +8613,6 @@ function Root() {
         setProfile(null);
         setPage(null);
         setAuth({ status: "signed_out" });
-        // Leaving the demo takes you back to the live sign-in form.
-        if (api.mode === "demo" && LIVE) setMode("live");
         if (typeof message === "string") ui.ok(message);
       }
     },
@@ -8825,7 +8752,7 @@ function Root() {
         </div>
       </div>
     );
-  if (auth.status === "signed_out") return <Login api={api} onDone={enter} onSwitchMode={LIVE ? switchMode : null} />;
+  if (auth.status === "signed_out") return <Login api={api} onDone={enter} />;
   if (auth.status === "set_password") return <SetPassword api={api} onDone={enter} />;
   if (auth.status === "inactive")
     return (

@@ -21,12 +21,13 @@ Two ways in, both on the same sign-in page:
 | `supabase/migrations/20260928000000_oe_schema.sql` | Full schema: tables, RLS, workflow functions, seeds (idempotent) |
 | `supabase/migrations/20260928000001_oe_bootstrap_accounts.sql` | Developer-only functions to create the first accounts, plus extra grants hardening |
 | `supabase/migrations/20260928000002_oe_live_starts_empty.sql` | Removes the sample projects once so live starts empty |
+| `supabase/migrations/20260929000000_oe_acumatica_and_role_guards.sql` | Acumatica items table and mapping column, database-side role guards |
 | `supabase/bootstrap_accounts.sql` | Template you run once in the SQL Editor to create admin / top management / accounting / liaison |
 | `supabase/functions/oe-invite-user/` | Edge Function used by Settings → Users to invite people (checks the caller's permission in the database) |
 | `scripts/bootstrap-users.mjs` | Terminal alternative to the SQL template, using the Auth admin API |
 | `vercel.json` | Security headers (CSP, HSTS, no framing, no indexing) and asset caching |
 | `middleware.js` | Vercel Edge Middleware: method allow-list, scanner block, per-IP rate limit |
-| `docs/` | The original files: `ExpenseMonitoring.jsx`, `supabase_schema.sql`, `SETUP.md` (functional manual), the PDF manual |
+| `docs/` | The original files: `ExpenseMonitoring.jsx`, `supabase_schema.sql`, `SETUP.md` (functional manual), the PDF manual; `upstream-2026-09-29/` holds the later app version that was merged in |
 
 ## Roles and modules
 
@@ -58,6 +59,7 @@ Withdrawn, Returned and Reclassified as side exits. `docs/SETUP.md` explains eac
 - [x] Captcha (Cloudflare Turnstile) wired but off until a site key is set
 - [x] Forgot-password removed from the sign-in page; resets are done by the administrator in SQL
 - [x] Live starts with an empty project listing (migration 0002)
+- [x] 2026-09-29 upstream update merged: Acumatica items and per-type mapping, Particulars columns, new printed form layout, admin-only administrator access, own-role rights lock (migration 20260929000000 + invite function redeploy)
 
 ### Phase 1. Supabase project
 1. Create a project at supabase.com (or use an existing one; every object is prefixed `oe_`).
@@ -146,6 +148,7 @@ signed-in session. Demo mode never touches Supabase: its sample data is built in
 | `oe_expense_categories` | Bidding, Collection, Support, Inspection, Testing (and the supporting-document rule) | Settings → Expense categories |
 | `oe_expense_types` | Expense types under each category with calc method, rate, fixed allocation, ERP account | Settings → Expense categories |
 | `oe_district_rates` | SOP rate overrides per district and expense type | Settings → Expense categories |
+| `oe_acumatica_items` | Acumatica INV IDs and descriptions; each expense type maps to one, shown on the printed form | Settings → Acumatica items |
 | `oe_counters` | Reference-number sequence per prefix and year | `oe_create_request` only |
 | `oe_requests` | Request header: reference no., dates, project, liaison, status, approval / ERP / disbursement stamps | Workflow functions only |
 | `oe_request_lines` | Each line: project, expense type, amount, approved amount, paid / returned amounts, line status | Workflow functions only |
@@ -164,6 +167,14 @@ and the request tables accept no direct writes from the app at all.
 A brand-new live system starts with an empty project listing (the sample projects from the original sheet are
 removed by the third migration; the two internal buckets stay), the default categories, types and rates, and no
 requests. Add projects in **Project listing → Add project**.
+
+## Role rules enforced in the database
+
+- Nobody can change their own role or access.
+- Only an administrator can give, change or remove administrator access, or invite an administrator.
+- A non-administrator cannot change the rights of their own role.
+- Fund returns are limited to administrators, top management and accounting, by role as well as by permission.
+- The invite function refuses an email that already has an account.
 
 ## Passwords
 

@@ -65,8 +65,16 @@ Deno.serve(async (req) => {
   if (roleErr) return json({ error: roleErr.message }, 500);
   if (!roleRow) return json({ error: "That role doesn't exist." }, 400);
 
-  const { data: existing } = await admin.from("oe_profiles").select("id").ilike("email", email).maybeSingle();
-  if (existing) return json({ error: "That email already has an account. Edit it in the user list instead." }, 409);
+  // Only an administrator may hand out the administrator role (the database applies the same rule to role changes).
+  if (role === "admin") {
+    const { data: isAdmin, error: adminErr } = await asCaller.rpc("oe_is_admin");
+    if (adminErr || isAdmin !== true) return json({ error: "Only an administrator can invite an administrator." }, 403);
+  }
+
+  // Never overwrite an existing account (including the caller's own) through an invite.
+  const { data: existing, error: existingErr } = await admin.from("oe_profiles").select("id").ilike("email", email).maybeSingle();
+  if (existingErr) return json({ error: existingErr.message }, 500);
+  if (existing) return json({ error: "That email already has an account. Change its role or access in the Users list instead." }, 409);
 
   const { data: invited, error: inviteErr } = await admin.auth.admin.inviteUserByEmail(email, {
     data: { full_name: fullName },
