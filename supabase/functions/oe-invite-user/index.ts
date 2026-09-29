@@ -71,8 +71,16 @@ Deno.serve(async (req) => {
     if (adminErr || isAdmin !== true) return json({ error: "Only an administrator can invite an administrator." }, 403);
   }
 
+  // A non-administrator may not hand out a role that itself manages users (the database applies the same rule).
+  if (!(await asCaller.rpc("oe_is_admin")).data) {
+    const { data: perms } = await admin.from("oe_role_permissions").select("permissions").eq("role", role).maybeSingle();
+    if (Array.isArray(perms?.permissions) && perms.permissions.includes("settings.users"))
+      return json({ error: "Only an administrator can invite someone into a role that manages users." }, 403);
+  }
+
   // Never overwrite an existing account (including the caller's own) through an invite.
-  const { data: existing, error: existingErr } = await admin.from("oe_profiles").select("id").ilike("email", email).maybeSingle();
+  const pattern = email.replace(/[\\%_]/g, (ch) => "\\" + ch); // literal match: % and _ are wildcards in ilike
+  const { data: existing, error: existingErr } = await admin.from("oe_profiles").select("id").ilike("email", pattern).maybeSingle();
   if (existingErr) return json({ error: existingErr.message }, 500);
   if (existing) return json({ error: "That email already has an account. Change its role or access in the Users list instead." }, 409);
 
@@ -81,6 +89,9 @@ Deno.serve(async (req) => {
     redirectTo,
   });
   if (inviteErr || !invited?.user) return json({ error: inviteErr?.message || "The invite couldn't be sent." }, 400);
+  // GoTrue re-sends an invite to a sign-in that exists but never accepted; that account keeps its role.
+  if (Date.now() - Date.parse(invited.user.created_at) > 60_000)
+    return json({ error: "That email already has a pending invite. Its role can be changed in the Users list." }, 409);
 
   // The auth trigger already created the profile row; set the details the administrator chose.
   const { error: profErr } = await admin

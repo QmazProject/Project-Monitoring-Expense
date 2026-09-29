@@ -132,5 +132,5 @@ Safeguards, all enforced in the database:
 - Amounts can't exceed what is still with the liaison, can't be zero, and a line can't be paid twice. Paid plus returned can never exceed the approved amount.
 - Dates can't be in the future or before the disbursement; a return needs a receipt number and a reason.
 - On a FOR-ASSIGNMENT line, a return can't cut into money already reclassified to projects, and a split can't exceed what is left after returns.
-- A return is final (no undo). Returned and fully paid lines can't be paid, returned or reclassified again.
+- A return is final (no undo). Returned and fully paid lines can't be paid or returned again. A split from an internal project can still be edited afterwards, as described under Reclassifying.
 - Request records can't be edited directly through the database API; every change goes through the checked workflow functions.

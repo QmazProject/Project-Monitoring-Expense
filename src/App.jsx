@@ -192,6 +192,21 @@ function sampleDocUrl(title, lines) {
   return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
 }
 
+/** data: URL → Blob without a network fetch (the Content Security Policy doesn't allow fetching data: URLs). */
+function dataUrlToBlob(dataUrl) {
+  const comma = dataUrl.indexOf(",");
+  const meta = dataUrl.slice(5, comma);
+  const payload = dataUrl.slice(comma + 1);
+  const mime = meta.split(";")[0] || "application/octet-stream";
+  if (/;base64$/i.test(meta)) {
+    const bin = atob(payload);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+  return new Blob([decodeURIComponent(payload)], { type: mime });
+}
+
 function readAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const r = new FileReader();
@@ -1314,13 +1329,18 @@ function createSupabaseApi() {
     },
     onAuthChange(cb) {
       let sub = null;
+      let off = false; // cleanup may run before the client promise resolves (React StrictMode)
       sb().then((client) => {
         sub = client.auth.onAuthStateChange((event, session) => {
           userId = session ? session.user.id : null;
           cb(event, session ? session.user : null);
         }).data.subscription;
+        if (off) sub.unsubscribe();
       });
-      return () => sub && sub.unsubscribe();
+      return () => {
+        off = true;
+        if (sub) sub.unsubscribe();
+      };
     },
     async signIn(identifier, password, captchaToken) {
       const email = loginEmail(identifier);
@@ -1351,14 +1371,19 @@ function createSupabaseApi() {
         clearTimeout(timer);
         timer = setTimeout(fn, 700);
       };
+      let off = false;
       sb().then((client) => {
+        if (off) return;
         channel = client
           .channel("oe-requests")
           .on("postgres_changes", { event: "*", schema: "public", table: "oe_requests" }, debounced)
-          .on("postgres_changes", { event: "*", schema: "public", table: "oe_request_lines" }, debounced)
+          // insert/update only: delete events aren't row-filtered by RLS, and an edit always touches the header too
+          .on("postgres_changes", { event: "INSERT", schema: "public", table: "oe_request_lines" }, debounced)
+          .on("postgres_changes", { event: "UPDATE", schema: "public", table: "oe_request_lines" }, debounced)
           .subscribe();
       });
       return () => {
+        off = true;
         clearTimeout(timer);
         if (channel) sb().then((c) => c.removeChannel(channel));
       };
@@ -1501,9 +1526,10 @@ function createSupabaseApi() {
       return null;
     },
     async withdrawRequest(id, remarks) { const c = await sb(); await ok(c.rpc("oe_withdraw_request", { p_id: id, p_remarks: remarks || null })); },
-    async approveRequest(id, lineAmounts, remarks) {
+    async approveRequest(id, lineAmounts, remarks, seen) {
       const c = await sb();
-      const p_lines = Object.entries(lineAmounts || {}).map(([lid, amt]) => ({ id: lid, approved_amount: amt }));
+      // "amount" is the requested amount the approver saw; the database refuses the approval if it changed meanwhile.
+      const p_lines = Object.entries(lineAmounts || {}).map(([lid, amt]) => ({ id: lid, approved_amount: amt, ...(seen && seen[lid] != null ? { amount: seen[lid] } : {}) }));
       await ok(c.rpc("oe_approve_request", { p_id: id, p_lines, p_remarks: remarks || null }));
     },
     async rejectRequest(id, remarks) { const c = await sb(); await ok(c.rpc("oe_reject_request", { p_id: id, p_remarks: remarks })); },
@@ -5669,7 +5695,7 @@ function ApprovalDetail({ request: r }) {
       if (a === null) return;
     }
     setBusy(true);
-    await run(() => api.approveRequest(r.id, amounts, remarks), `${r.ref_no} approved`);
+    await run(() => api.approveRequest(r.id, amounts, remarks, Object.fromEntries(r.lines.map((l) => [l.id, Number(l.amount)]))), `${r.ref_no} approved`);
     setBusy(false);
   };
   const reject = async () => {
@@ -7221,7 +7247,18 @@ function DocumentViewer({ docs, index = 0, title, onClose }) {
             </>
           )}
           {url && (
-            <a className="oe-btn secondary" href={url} target="_blank" rel="noopener noreferrer">
+            <a
+              className="oe-btn secondary"
+              href={url}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => {
+                // browsers refuse to open data: URLs (demo documents) as a page; hand them over as a blob instead
+                if (!String(url).startsWith("data:")) return;
+                e.preventDefault();
+                window.open(URL.createObjectURL(dataUrlToBlob(url)), "_blank", "noopener");
+              }}
+            >
               Open in new tab
             </a>
           )}
@@ -8646,17 +8683,19 @@ function Root() {
   const [mode, setMode] = useState(LIVE ? "live" : "demo");
   const api = useMemo(() => (mode === "live" ? createSupabaseApi() : createDemoApi()), [mode]);
   const [auth, setAuth] = useState({ status: "loading" });
-  const switchMode = useCallback((m) => {
-    if (m === "live" && !LIVE) return;
-    if (m === "demo" && !DEMO_ENABLED) return;
-    setAuth({ status: "loading" });
-    setMode(m);
-  }, []);
   const [profile, setProfile] = useState(null);
   const [data, setData] = useState(null);
   const [page, setPage] = useState(null);
   const [params, setParams] = useState(null);
   const [navOpen, setNavOpen] = useState(false);
+  const switchMode = useCallback((m) => {
+    if (m === "live" && !LIVE) return;
+    if (m === "demo" && !DEMO_ENABLED) return;
+    setPage(null);
+    setParams(null);
+    setAuth({ status: "loading" });
+    setMode(m);
+  }, []);
 
   const reload = useCallback(async () => {
     const d = await api.loadAll();
@@ -8683,6 +8722,7 @@ function Root() {
         setData(null);
         setProfile(null);
         setPage(null);
+        setParams(null); // otherwise the next sign-in on this tab inherits e.g. an "edit request" target
         setAuth({ status: "signed_out" });
         // Leaving the demo takes you back to the live sign-in form.
         if (api.mode === "demo" && LIVE) setMode("live");

@@ -176,6 +176,19 @@ requests. Add projects in **Project listing → Add project**.
 - Fund returns are limited to administrators, top management and accounting, by role as well as by permission.
 - The invite function refuses an email that already has an account.
 
+## Notes from the 2026-09-29 review
+
+- **Dates** are checked against the company's calendar day. The timezone is stored in Settings data as
+  `timezone` (default `Asia/Manila`); change it with `update oe_settings set data = data || '{"timezone": "Asia/Manila"}'`.
+- **Approval** is refused if the liaison edited the request (lines or amounts) while the approver had it open.
+  The approver reloads and reviews again.
+- **User managers**: a role that has *Users, access rights and system settings* is powerful by design. It can
+  create roles and put people on them. The database stops such a user, when they are not an administrator, from
+  touching administrators, from granting user-management rights to any role, and from inviting people into a
+  role that has them. Give this permission only to administrators unless you accept that.
+- **Re-running the original schema file** by hand (`docs/supabase_schema.sql`) drops the policies of tables that
+  later migrations added. Use `supabase db push`, or re-run the later migrations afterwards.
+
 ## Passwords
 
 There is no "Forgot password" on the sign-in page and no self-service reset. When someone forgets their
