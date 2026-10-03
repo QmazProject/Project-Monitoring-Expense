@@ -41,7 +41,7 @@ It uses the project's built-in `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE
 
 The default Supabase invite email is plain text. A branded version lives in `supabase/templates/invite.html` (greeting by name, email and role, a *Set my password* button, expiry note). Apply it one of two ways:
 
-- `supabase config push` from the folder that contains `supabase/` (the template is wired in `config.toml` under `[auth.email.template.invite]`), or
+- `SITE_URL=https://your-app.vercel.app supabase config push` from the folder that contains `supabase/` (the template is wired in `config.toml` under `[auth.email.template.invite]`; the push also sends Site URL and Redirect URLs, which `config.toml` reads from `SITE_URL`, so never push with a local address), or
 - Dashboard → **Authentication → Emails → Templates → Invite user**: paste the file's contents into the body and set the subject to *You're invited to Project Expense Monitoring*.
 
 The role shown in the email comes from the invite function (`role_label` in the user's metadata), so redeploy the function after pulling this change. To change the sender name and address, set up custom SMTP (Authentication → Emails → SMTP Settings).

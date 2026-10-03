@@ -78,10 +78,15 @@ Withdrawn, Returned and Reclassified as side exits. `docs/SETUP.md` explains eac
 5. Dashboard → **Authentication → URL Configuration**: Site URL = your Vercel address; add it under Redirect URLs
    (invite and password-reset links return there).
 6. Invite email design: `supabase/templates/invite.html` is a branded template (name, email, role, "Set my password"
-   button). Apply it with `supabase config push` (it reads `[auth.email.template.invite]` in `supabase/config.toml`),
-   or paste its contents into Dashboard → **Authentication → Emails → Templates → Invite user** and set the subject
-   to "You're invited to Project Expense Monitoring". The sender name ("Supabase Auth") only changes with custom SMTP
-   (see Later, below).
+   button). Apply it with `SITE_URL=https://your-app.vercel.app supabase config push` (it reads
+   `[auth.email.template.invite]` in `supabase/config.toml`), or paste its contents into Dashboard →
+   **Authentication → Emails → Templates → Invite user** and set the subject to "You're invited to Project Expense
+   Monitoring". The sender name ("Supabase Auth") only changes with custom SMTP (see Later, below).
+
+   **Careful:** `supabase config push` sends the whole `[auth]` section, including Site URL and Redirect URLs. That is
+   why `config.toml` reads them from `SITE_URL`. Pushing without `SITE_URL` set, or with a local address, makes every
+   invite link redirect to a page that does not exist ("127.0.0.1 refused to connect"). After any push, check
+   Dashboard → Authentication → URL Configuration still shows the Vercel address.
 
 ### Phase 2. First accounts (developer)
 Pick one:
