@@ -77,6 +77,11 @@ Withdrawn, Returned and Reclassified as side exits. `docs/SETUP.md` explains eac
    (`supabase/config.toml` already has `enable_signup = false`; `supabase config push` applies it to the hosted project too.)
 5. Dashboard → **Authentication → URL Configuration**: Site URL = your Vercel address; add it under Redirect URLs
    (invite and password-reset links return there).
+6. Invite email design: `supabase/templates/invite.html` is a branded template (name, email, role, "Set my password"
+   button). Apply it with `supabase config push` (it reads `[auth.email.template.invite]` in `supabase/config.toml`),
+   or paste its contents into Dashboard → **Authentication → Emails → Templates → Invite user** and set the subject
+   to "You're invited to Project Expense Monitoring". The sender name ("Supabase Auth") only changes with custom SMTP
+   (see Later, below).
 
 ### Phase 2. First accounts (developer)
 Pick one:
@@ -90,7 +95,8 @@ Pick one:
   `scripts/bootstrap-users.example.json` to `scripts/bootstrap-users.json`, edit it, run `npm run bootstrap:users`.
 
 Roles: `admin`, `tm`, `accounting`, `liaison`, `viewer`. After that, everyone else is invited from
-**Settings → Users** inside the app (administrator only). The invited person gets an email link that
+**Settings → Users** inside the app (administrator only). The Users list shows each invite's status: *Pending*
+until the person sets a password, then *Accepted*. The invited person gets an email link that
 opens the app on a *Set your password* page showing their name, email and role. They type and retype
 a password, press *Confirm password*, and are returned to the sign-in page (email prefilled) to sign in
 with it.

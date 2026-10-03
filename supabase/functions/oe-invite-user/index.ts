@@ -61,7 +61,7 @@ Deno.serve(async (req) => {
   // 3. Do the privileged work with the service role
   const admin = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
 
-  const { data: roleRow, error: roleErr } = await admin.from("oe_role_permissions").select("role").eq("role", role).maybeSingle();
+  const { data: roleRow, error: roleErr } = await admin.from("oe_role_permissions").select("role, label").eq("role", role).maybeSingle();
   if (roleErr) return json({ error: roleErr.message }, 500);
   if (!roleRow) return json({ error: "That role doesn't exist." }, 400);
 
@@ -84,8 +84,9 @@ Deno.serve(async (req) => {
   if (existingErr) return json({ error: existingErr.message }, 500);
   if (existing) return json({ error: "That email already has an account. Change its role or access in the Users list instead." }, 409);
 
+  // full_name / role_label are only used by the invite email and the sign-up trigger; the real role lives in oe_profiles.
   const { data: invited, error: inviteErr } = await admin.auth.admin.inviteUserByEmail(email, {
-    data: { full_name: fullName },
+    data: { full_name: fullName, role_label: roleRow.label || role },
     redirectTo,
   });
   if (inviteErr || !invited?.user) return json({ error: inviteErr?.message || "The invite couldn't be sent." }, 400);
@@ -96,7 +97,7 @@ Deno.serve(async (req) => {
   // The auth trigger already created the profile row; set the details the administrator chose.
   const { error: profErr } = await admin
     .from("oe_profiles")
-    .upsert({ id: invited.user.id, email, full_name: fullName, role, is_active: true });
+    .upsert({ id: invited.user.id, email, full_name: fullName, role, is_active: true, invited_at: new Date().toISOString(), accepted_at: null });
   if (profErr) return json({ error: `Invited, but the role could not be saved: ${profErr.message}` }, 500);
 
   return json({ ok: true, id: invited.user.id });

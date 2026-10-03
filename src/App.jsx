@@ -1275,7 +1275,7 @@ function createDemoApi() {
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email || "")) throw new Error("Enter a valid email address.");
       if (db.profiles.some((p) => norm(p.email) === norm(email))) throw new Error("That email already has an account. Change its role or access in the Users list instead.");
       if (role === "admin" && profile().role !== "admin") throw new Error("Only an administrator can invite an administrator.");
-      db.profiles.push({ id: uid(), email: email.trim().toLowerCase(), full_name: full_name || email.split("@")[0], role, is_active: true });
+      db.profiles.push({ id: uid(), email: email.trim().toLowerCase(), full_name: full_name || email.split("@")[0], role, is_active: true, invited_at: new Date().toISOString(), accepted_at: null });
     }),
     saveRole: (r) => mutate(() => {
       need("settings.users");
@@ -1360,6 +1360,8 @@ function createSupabaseApi() {
     async updatePassword(password) {
       const client = await sb();
       await ok(client.auth.updateUser({ password }));
+      // Shows "Accepted" in Settings → Users. The password is already saved, so a failure here is not an error for the person.
+      try { await client.rpc("oe_accept_invite"); } catch (e) { /* status only */ }
     },
     async getProfile() {
       const client = await sb();
@@ -2087,8 +2089,8 @@ function MoneyInput({ value, onChange, className = "", ...rest }) {
   );
 }
 
-function Chip({ tone = "muted", children, plain, className = "" }) {
-  return <span className={`oe-chip tone-${tone} ${plain ? "plain" : ""} ${className}`}>{children}</span>;
+function Chip({ tone = "muted", children, plain, className = "", title }) {
+  return <span className={`oe-chip tone-${tone} ${plain ? "plain" : ""} ${className}`} title={title}>{children}</span>;
 }
 
 function StatusChip({ status }) {
@@ -7979,6 +7981,7 @@ function UsersAdmin() {
               <th>Name</th>
               <th>Email</th>
               <th>Role</th>
+              <th>Invite</th>
               <th>Access</th>
               <th />
             </tr>
@@ -8004,6 +8007,15 @@ function UsersAdmin() {
                       ))}
                     </select>
                   </td>
+                  <td>
+                    {u.accepted_at ? (
+                      <Chip tone="teal" className="status" title={`Password set ${fmtDateTime(u.accepted_at)}`}>Accepted</Chip>
+                    ) : u.invited_at ? (
+                      <Chip tone="amber" className="status" title={`Invited ${fmtDateTime(u.invited_at)}. Hasn't opened the link and set a password yet.`}>Pending</Chip>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </td>
                   <td>{u.is_active ? <Chip tone="teal">Can sign in</Chip> : <Chip tone="amber">No access</Chip>}</td>
                   <td className="r" style={{ whiteSpace: "nowrap" }}>
                     <Button size="sm" variant="ghost" icon="edit" aria-label={`Rename ${u.full_name}`} onClick={() => setEditing(u)} />
@@ -8021,7 +8033,7 @@ function UsersAdmin() {
       </div>
       <p className="muted small">
         {LIVE
-          ? "People who sign up on their own start with no access. Invites send an email link that opens this app so the person can set a password."
+          ? "Invites send an email link that opens this app so the person can set a password. Pending means they haven't opened it yet; Accepted means their password is set."
           : "Demo mode: invited users are added to the demo list only."}
       </p>
       {inviting && <InviteForm roles={roles} onClose={() => setInviting(false)} />}

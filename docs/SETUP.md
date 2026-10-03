@@ -37,6 +37,19 @@ supabase functions deploy oe-invite-user
 
 It uses the project's built-in `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY`; nothing to configure. It only works for users whose role has *Manage users and access rights*.
 
+### Invite email design
+
+The default Supabase invite email is plain text. A branded version lives in `supabase/templates/invite.html` (greeting by name, email and role, a *Set my password* button, expiry note). Apply it one of two ways:
+
+- `supabase config push` from the folder that contains `supabase/` (the template is wired in `config.toml` under `[auth.email.template.invite]`), or
+- Dashboard → **Authentication → Emails → Templates → Invite user**: paste the file's contents into the body and set the subject to *You're invited to Project Expense Monitoring*.
+
+The role shown in the email comes from the invite function (`role_label` in the user's metadata), so redeploy the function after pulling this change. To change the sender name and address, set up custom SMTP (Authentication → Emails → SMTP Settings).
+
+### Invite status in Settings → Users
+
+Each row shows *Pending* (invited, hasn't set a password yet) or *Accepted* (password set). This needs migration `20261003000000_oe_invite_status.sql` (`supabase db push`), which also fills in the status for invites sent earlier.
+
 ## 5. App
 
 1. Open `ExpenseMonitoring.jsx` and fill `CONFIG` at the top with the project URL and **anon** key (Project Settings → API). Never use the service_role key in the app.
