@@ -11,7 +11,7 @@ Three pieces: the database (`supabase_schema.sql`), one edge function for inviti
 ## 2. Sign-in settings
 
 1. **Authentication → Sign In / Providers**: turn off *Allow new users to sign up*. People only get in by invite.
-2. **Authentication → URL Configuration**: set *Site URL* to the app's address and add the same address under *Redirect URLs*. Invite and password-reset links return there.
+2. **Authentication → URL Configuration**: set *Site URL* to the app's address and add `https://<the app's address>/**` under *Redirect URLs*. Invite links return to `/invite/set-password`, the page where the person chooses their password.
 
 ## 3. First administrator
 
@@ -41,7 +41,7 @@ It uses the project's built-in `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE
 
 The default Supabase invite email is plain text. A branded version lives in `supabase/templates/invite.html` (greeting by name, email and role, a *Set my password* button, expiry note). Apply it one of two ways:
 
-- `SITE_URL=https://your-app.vercel.app supabase config push` from the folder that contains `supabase/` (the template is wired in `config.toml` under `[auth.email.template.invite]`; the push also sends Site URL and Redirect URLs, which `config.toml` reads from `SITE_URL`, so never push with a local address), or
+- `supabase config push` from the folder that contains `supabase/` (the template is wired in `config.toml` under `[auth.email.template.invite]`; the push also sends the Site URL and Redirect URLs written there, so keep them at the deployed address), or
 - Dashboard → **Authentication → Emails → Templates → Invite user**: paste the file's contents into the body and set the subject to *You're invited to Project Expense Monitoring*.
 
 The role shown in the email comes from the invite function (`role_label` in the user's metadata), so redeploy the function after pulling this change. To change the sender name and address, set up custom SMTP (Authentication → Emails → SMTP Settings).
@@ -49,6 +49,8 @@ The role shown in the email comes from the invite function (`role_label` in the 
 ### Invite status in Settings → Users
 
 Each row shows *Pending* (invited, hasn't set a password yet) or *Accepted* (password set). This needs migration `20261003000000_oe_invite_status.sql` (`supabase db push`), which also fills in the status for invites sent earlier.
+
+The same stamp protects the invite: a person whose invite is still *Pending* can only ever reach the *Set your password* page, however they arrive (the email button, the plain link, a second click, a saved session, or typing the address). Opening an invite link a second time shows the sign-in page with "That link was already used or has expired".
 
 ## 5. App
 

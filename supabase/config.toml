@@ -157,14 +157,13 @@ enabled = true
 # The base URL of your website. Used as an allow-list for redirects and for constructing URLs used
 # in emails.
 # Where invite and password-reset links return to. `supabase config push` sends this section to the hosted
-# project, so it must be the deployed app's address, never a local one. It is read from the SITE_URL variable:
-#   SITE_URL=https://your-app.vercel.app supabase config push
-site_url = "env(SITE_URL)"
+# project, so it must be the deployed app's address, never a local one.
+site_url = "https://project-monitoring-expense.vercel.app"
 # The public URL that Auth serves on. Defaults to the API external URL with `/auth/v1` appended.
 # external_url = ""
-# A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
-# The app asks to return to the page the invite was sent from, so that address must be listed here.
-additional_redirect_urls = ["env(SITE_URL)", "http://localhost:5173"]
+# URLs that auth may redirect to after a link is verified. Invites return to /invite/set-password,
+# so the deployed address is allowed with every path (/**); localhost is for `npm run dev`.
+additional_redirect_urls = ["https://project-monitoring-expense.vercel.app/**", "http://localhost:5173/**"]
 # How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 (1 week).
 jwt_expiry = 3600
 # JWT issuer URL. If not set, defaults to auth.external_url.

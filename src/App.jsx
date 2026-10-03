@@ -37,6 +37,11 @@ const LIVE = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseAnonKey);
 const DEMO_ENABLED = !LIVE || CONFIG.demoEnabled !== false;
 const INITIAL_HASH = typeof window !== "undefined" ? window.location.hash : "";
 const NEEDS_PASSWORD = /type=(invite|recovery)/.test(INITIAL_HASH);
+/** The set-password page's own address. Invite emails return here (vercel.json rewrites it to the app). */
+const INVITE_PATH = "/invite/set-password";
+const INITIAL_PATH = typeof window !== "undefined" ? window.location.pathname : "/";
+// Supabase returns here with #error=...&error_code=otp_expired when an invite link is opened a second time or too late.
+const LINK_ERROR = /(^#|&)error=/.test(INITIAL_HASH) ? ((INITIAL_HASH.match(/error_code=([^&]*)/) || [])[1] || "error") : "";
 
 /* ---------------------------------------------------------------------
    2. CONSTANTS
@@ -1560,7 +1565,7 @@ function createSupabaseApi() {
     async inviteUser(body) {
       const c = await sb();
       const { data, error } = await c.functions.invoke("oe-invite-user", {
-        body: { ...body, redirect_to: window.location.origin + window.location.pathname },
+        body: { ...body, redirect_to: window.location.origin + INVITE_PATH },
       });
       if (error) {
         let msg = error.message;
@@ -8686,7 +8691,7 @@ function SetPassword({ api, onDone }) {
           <div>
             <h2>Set your password</h2>
             <p className="muted" style={{ marginTop: 4 }}>
-              You've been invited to this system. Choose a password, then sign in with it.
+              You've been invited to this system. Choose a password, then sign in with it. Until you do, this is the only page you can open.
             </p>
           </div>
           {who && (
@@ -8768,6 +8773,10 @@ function Root() {
     setLoginNotice(null);
     const prof = await api.getProfile();
     setProfile(prof);
+    if (prof && prof.invited_at && !prof.accepted_at) {
+      setAuth({ status: "set_password" });
+      return;
+    }
     if (!prof || !prof.is_active) {
       setAuth({ status: "inactive" });
       return;
@@ -8809,7 +8818,14 @@ function Root() {
       try {
         const user = await api.init();
         if (!alive) return;
-        if (!user) return setAuth({ status: "signed_out" });
+        if (LINK_ERROR && window.history && window.history.replaceState) window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        if (!user) {
+          if (LINK_ERROR)
+            setLoginNotice({ tone: "warn", text: /expired/i.test(LINK_ERROR) ? "That link was already used or has expired. Ask your administrator to send a new invite." : "That link could not be used. Ask your administrator to send a new invite." });
+          else if (INITIAL_PATH === INVITE_PATH)
+            setLoginNotice({ tone: "info", text: "To set your password, open the link in your invitation email. Already set it? Sign in below." });
+          return setAuth({ status: "signed_out" });
+        }
         if (NEEDS_PASSWORD) return setAuth({ status: "set_password" });
         await enter();
       } catch (e) {
@@ -8912,8 +8928,17 @@ function Root() {
     [api, data, idx, me, can, run, go, reload, ui, setLeaveGuard, confirmLeave]
   );
 
+  // address bar: the set-password page lives at INVITE_PATH; every other screen is at the root
+  useEffect(() => {
+    if (!(window.history && window.history.replaceState) || auth.status === "loading") return;
+    const want = auth.status === "set_password" ? INVITE_PATH : "/";
+    const at = window.location.pathname;
+    if (at !== want && (want === INVITE_PATH || at === INVITE_PATH || at.startsWith("/invite/")))
+      window.history.replaceState(null, "", want + window.location.search);
+  }, [auth.status]);
+
   // the browser tab stays neutral until someone is signed in
-  const tabTitle = auth.status === "ready" ? "Project Expense Monitoring" : "Sign in";
+  const tabTitle = auth.status === "ready" ? "Project Expense Monitoring" : auth.status === "set_password" ? "Set your password" : "Sign in";
   useEffect(() => {
     document.title = tabTitle;
   }, [tabTitle]);
