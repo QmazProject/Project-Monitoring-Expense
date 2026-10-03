@@ -896,6 +896,7 @@ function createDemoApi() {
     async signOut() { me = null; },
     async updatePassword() {},
     async getProfile() { return clone(profile() || null); },
+    async getRoleLabel(role) { const r = db.roles.find((x) => x.role === role); return r ? r.label : role; },
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
 
     async loadAll() {
@@ -1363,6 +1364,11 @@ function createSupabaseApi() {
     async getProfile() {
       const client = await sb();
       return ok(client.from("oe_profiles").select("*").eq("id", userId).maybeSingle());
+    },
+    async getRoleLabel(role) {
+      const client = await sb();
+      const { data } = await client.from("oe_role_permissions").select("label").eq("role", role).maybeSingle();
+      return (data && data.label) || role;
     },
     subscribe(fn) {
       let channel = null;
@@ -1909,6 +1915,7 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-signin-mark g{fill:none;stroke:var(--teal-d);stroke-width:1.6}
 .oe-signin-foot{position:absolute;left:0;right:0;bottom:calc(26px + env(safe-area-inset-bottom,0px));display:flex;align-items:center;justify-content:center;gap:8px;color:rgba(214,242,238,.66);font-size:13px}
 .oe-pass{position:relative}.oe-pass .oe-input{padding-right:68px}
+.oe-invite-who{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--sunk)}
 .oe-pass button{position:absolute;right:5px;top:50%;transform:translateY(-50%);height:28px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:var(--teal-d);font-size:12.5px;font-weight:500;cursor:pointer}
 .oe-pass button:hover{background:var(--teal-50)}
 .oe-demo-users{display:grid;gap:8px}
@@ -8490,10 +8497,10 @@ function Captcha({ siteKey, onToken, resetKey }) {
   return <div ref={box} className="oe-captcha" />;
 }
 
-function Login({ api, onDone, onSwitchMode }) {
-  const [f, setF] = useState({ user: "", password: "" });
+function Login({ api, onDone, onSwitchMode, notice }) {
+  const [f, setF] = useState({ user: (notice && notice.user) || "", password: "" });
   const [show, setShow] = useState(false);
-  const [msg, setMsg] = useState(null);
+  const [msg, setMsg] = useState(notice ? { tone: notice.tone || "info", text: notice.text } : null);
   const [busy, setBusy] = useState(false);
   const demo = api.mode === "demo";
   const captchaOn = !demo && Boolean(CONFIG.captchaSiteKey);
@@ -8624,21 +8631,42 @@ function Login({ api, onDone, onSwitchMode }) {
 function SetPassword({ api, onDone }) {
   const [a, setA] = useState("");
   const [b, setB] = useState("");
+  const [show, setShow] = useState(false);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // Who the invite is for, read from the profile the administrator created with the invite.
+  const [who, setWho] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const prof = await api.getProfile();
+        if (!prof) return;
+        const roleLabel = await api.getRoleLabel(prof.role);
+        if (alive) setWho({ name: prof.full_name || "", email: prof.email || "", roleLabel });
+      } catch (x) {
+        /* the form still works without the summary */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [api]);
   const submit = async (e) => {
     e.preventDefault();
+    if (busy) return;
     if (a.length < 8) return setErr("Use at least 8 characters.");
     if (a !== b) return setErr("The two passwords don't match.");
+    setErr("");
     setBusy(true);
     try {
       await api.updatePassword(a);
       if (window.history && window.history.replaceState) window.history.replaceState(null, "", window.location.pathname + window.location.search);
-      await onDone();
+      await onDone(who ? who.email : "");
     } catch (x) {
       setErr(x.message);
+      setBusy(false);
     }
-    setBusy(false);
   };
   return (
     <SignInFrame>
@@ -8646,18 +8674,38 @@ function SetPassword({ api, onDone }) {
           <div>
             <h2>Set your password</h2>
             <p className="muted" style={{ marginTop: 4 }}>
-              You'll use it with your email to sign in from now on.
+              You've been invited to this system. Choose a password, then sign in with it.
             </p>
           </div>
-          <Field label="New password" hint="At least 8 characters">
-            <input className="oe-input" type="password" autoComplete="new-password" value={a} onChange={(e) => setA(e.target.value)} />
+          {who && (
+            <div className="oe-invite-who">
+              <div>
+                <b style={{ color: "var(--ink)", fontWeight: 500 }}>{who.name || who.email}</b>
+                {who.name && (
+                  <span className="muted small" style={{ display: "block" }}>
+                    {who.email}
+                  </span>
+                )}
+              </div>
+              <Chip tone="teal" plain>
+                {who.roleLabel}
+              </Chip>
+            </div>
+          )}
+          <Field label="New password" hint="At least 8 characters" as="div">
+            <div className="oe-pass">
+              <input className="oe-input" type={show ? "text" : "password"} autoComplete="new-password" aria-label="New password" autoFocus value={a} onChange={(e) => setA(e.target.value)} />
+              <button type="button" onClick={() => setShow((v) => !v)} aria-label={show ? "Hide password" : "Show password"}>
+                {show ? "Hide" : "Show"}
+              </button>
+            </div>
           </Field>
-          <Field label="Repeat password">
-            <input className="oe-input" type="password" autoComplete="new-password" value={b} onChange={(e) => setB(e.target.value)} />
+          <Field label="Retype password">
+            <input className="oe-input" type={show ? "text" : "password"} autoComplete="new-password" value={b} onChange={(e) => setB(e.target.value)} />
           </Field>
           {err && <Note tone="bad">{err}</Note>}
           <Button variant="primary" busy={busy} onClick={submit}>
-            Save password
+            Confirm password
           </Button>
         </div>
     </SignInFrame>
@@ -8688,6 +8736,7 @@ function Root() {
   const [page, setPage] = useState(null);
   const [params, setParams] = useState(null);
   const [navOpen, setNavOpen] = useState(false);
+  const [loginNotice, setLoginNotice] = useState(null); // shown on the sign-in page after an invite's password is set
   const switchMode = useCallback((m) => {
     if (m === "live" && !LIVE) return;
     if (m === "demo" && !DEMO_ENABLED) return;
@@ -8704,6 +8753,7 @@ function Root() {
   }, [api]);
 
   const enter = useCallback(async () => {
+    setLoginNotice(null);
     const prof = await api.getProfile();
     setProfile(prof);
     if (!prof || !prof.is_active) {
@@ -8730,6 +8780,15 @@ function Root() {
       }
     },
     [api, ui]
+  );
+
+  // The invited person has confirmed a password: end the invite session and ask them to sign in with it.
+  const passwordSet = useCallback(
+    async (email) => {
+      setLoginNotice({ tone: "info", user: email || "", text: "Your password is saved. Sign in with your email and the password you just set." });
+      await signOut();
+    },
+    [signOut]
   );
 
   useEffect(() => {
@@ -8865,8 +8924,8 @@ function Root() {
         </div>
       </div>
     );
-  if (auth.status === "signed_out") return <Login api={api} onDone={enter} onSwitchMode={LIVE ? switchMode : null} />;
-  if (auth.status === "set_password") return <SetPassword api={api} onDone={enter} />;
+  if (auth.status === "signed_out") return <Login key={loginNotice ? "after-invite" : "plain"} api={api} onDone={enter} onSwitchMode={LIVE ? switchMode : null} notice={loginNotice} />;
+  if (auth.status === "set_password") return <SetPassword api={api} onDone={passwordSet} />;
   if (auth.status === "inactive")
     return (
       <div className="oe-center">

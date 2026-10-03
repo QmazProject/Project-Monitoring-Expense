@@ -90,7 +90,10 @@ Pick one:
   `scripts/bootstrap-users.example.json` to `scripts/bootstrap-users.json`, edit it, run `npm run bootstrap:users`.
 
 Roles: `admin`, `tm`, `accounting`, `liaison`, `viewer`. After that, everyone else is invited from
-**Settings → Users** inside the app (administrator only).
+**Settings → Users** inside the app (administrator only). The invited person gets an email link that
+opens the app on a *Set your password* page showing their name, email and role. They type and retype
+a password, press *Confirm password*, and are returned to the sign-in page (email prefilled) to sign in
+with it.
 
 ### Phase 3. Run locally
 ```bash
