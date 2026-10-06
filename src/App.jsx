@@ -1605,8 +1605,17 @@ function createSupabaseApi() {
       const c = await sb();
       await c.from("oe_push_subscriptions").delete().eq("endpoint", endpoint);
     },
+    // unlike notify(), this one reports what went wrong, so the person is not told "on" when it isn't
     async pushTest() {
-      await notify("test", null);
+      const c = await sb();
+      const { data, error } = await c.functions.invoke("oe-push", { body: { event: "test" } });
+      if (error) {
+        let msg = error.message;
+        try { msg = (await error.context.json()).error || msg; } catch (e) { /* keep generic */ }
+        throw new Error(msg);
+      }
+      if (data && data.error) throw new Error(data.error);
+      return data; // { sent, failed, removed }
     },
     async setErpRef(id, ref) { const c = await sb(); await ok(c.rpc("oe_set_erp_ref", { p_id: id, p_erp_ref: ref })); },
     async disburseRequest(id, date, remarks) { const c = await sb(); await ok(c.rpc("oe_disburse_request", { p_id: id, p_date: date, p_remarks: remarks || null })); },
@@ -9127,6 +9136,17 @@ function usePush(api, ready, approver) {
   useEffect(() => {
     if (offered && ready && perm === "granted") pushSubscribe(api).catch(() => {});
   }, [offered, ready, perm, api]);
+  // saves this device's subscription, then asks the server for a test notification and reports what happened
+  const sendTest = useCallback(
+    async (okText) => {
+      await pushSubscribe(api);
+      const r = await api.pushTest();
+      if (r && r.sent === 0)
+        ui.err(r.failed ? "This device is signed up, but the push service refused the test message. Try again in a minute." : "This device could not be found for the test message. Turn notifications off and on again.");
+      else ui.ok(okText);
+    },
+    [api, ui]
+  );
   const enable = useCallback(async () => {
     setBusy(true);
     try {
@@ -9136,15 +9156,24 @@ function usePush(api, ready, approver) {
         if (p === "denied") ui.err("Notifications are blocked for this site. Allow them in the browser's site settings, then try again.");
         return;
       }
-      await pushSubscribe(api);
-      await api.pushTest();
-      ui.ok("Notifications are on. A test notification is on its way.");
+      await sendTest("Notifications are on. A test notification is on its way.");
     } catch (e) {
       ui.err((e && e.message) || "Notifications could not be turned on.");
     } finally {
       setBusy(false);
     }
-  }, [api, ui]);
+  }, [ui, sendTest]);
+  // the "Test notifications" button in the side panel, for a device that already allowed them
+  const test = useCallback(async () => {
+    setBusy(true);
+    try {
+      await sendTest("A test notification is on its way to your devices.");
+    } catch (e) {
+      ui.err((e && e.message) || "The test notification could not be sent.");
+    } finally {
+      setBusy(false);
+    }
+  }, [ui, sendTest]);
   const notNow = useCallback(() => {
     try {
       sessionStorage.setItem(PUSH_LATER_KEY, "1");
@@ -9155,7 +9184,7 @@ function usePush(api, ready, approver) {
   }, []);
   const iosNeedsInstall = IS_IOS && !STANDALONE && !PUSH_SUPPORTED && api.mode === "live" && !!CONFIG.vapidPublicKey;
   const show = ready && !later && (offered ? perm === "default" || perm === "denied" : iosNeedsInstall);
-  return { show, perm, busy, enable, notNow, iosNeedsInstall, approver };
+  return { show, perm, busy, enable, test, granted: offered && perm === "granted", notNow, iosNeedsInstall, approver };
 }
 function PushCard({ push }) {
   if (!push.show) return null;
@@ -9625,6 +9654,11 @@ function Root() {
               <button onClick={async () => (await confirmLeave()) && signOut()} title={collapsed ? "Sign out" : undefined} aria-label="Sign out">
                 <Icon name="logout" size={14} /> <span className="lbl">Sign out</span>
               </button>
+              {push.granted && (
+                <button onClick={push.test} disabled={push.busy} title={collapsed ? "Test notifications" : undefined} aria-label="Test notifications">
+                  <Icon name="bell" size={14} /> <span className="lbl">Test notifications</span>
+                </button>
+              )}
               {/* phones and tablets only: desktop browsers already offer install in the address bar */}
               {canInstall && !desktop && (
                 <button onClick={install} title={collapsed ? "Install app" : undefined} aria-label="Install app">
