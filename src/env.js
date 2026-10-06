@@ -11,4 +11,6 @@ globalThis.OE_CONFIG = {
   demoEnabled: str(env.VITE_DEMO_ENABLED).toLowerCase() !== "false",
   // Cloudflare Turnstile site key. Leave empty until captcha is switched on in Supabase (Auth → Attack protection).
   captchaSiteKey: str(env.VITE_TURNSTILE_SITE_KEY),
+  // Public half of the push notification key pair (npm run push:keys). Empty = notifications are not offered.
+  vapidPublicKey: str(env.VITE_VAPID_PUBLIC_KEY),
 };

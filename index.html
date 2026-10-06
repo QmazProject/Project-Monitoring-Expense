@@ -2,12 +2,26 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="robots" content="noindex, nofollow" />
     <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta name="theme-color" content="#0b4338" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- Installed as an app (vite.config.js writes the manifest; these are the iOS equivalents) -->
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon-180.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="PEM" />
     <!-- Kept neutral on purpose: the app sets the real title after sign-in. -->
     <title>Sign in</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #eef3f2;
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>

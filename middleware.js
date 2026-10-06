@@ -13,8 +13,9 @@
 import { next } from "@vercel/edge";
 
 export const config = {
-  // Skip hashed build assets and the favicon: they are immutable and harmless to fetch.
-  matcher: ["/((?!assets/|favicon\\.svg).*)"],
+  // Skip hashed build assets, the icons and the installed-app files (service worker, manifest): harmless to fetch,
+  // and the service worker re-checks sw.js on every launch.
+  matcher: ["/((?!assets/|icons/|favicon\\.svg|sw\\.js|workbox-|manifest\\.webmanifest).*)"],
 };
 
 const WINDOW_MS = 60_000; // 1 minute

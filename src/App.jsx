@@ -26,6 +26,7 @@ const CONFIG = {
   demoEnabled: true,
   // Cloudflare Turnstile site key. Empty until captcha is switched on in Supabase (Auth → Attack protection).
   captchaSiteKey: "",
+  vapidPublicKey: "", // public push key (VITE_VAPID_PUBLIC_KEY); empty = notifications are not offered
   // Excel export (loaded only when someone exports). Pinned version with an integrity
   // check: the browser refuses the file if it ever differs from this exact release.
   excelJsUrl: "https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js",
@@ -40,6 +41,30 @@ const NEEDS_PASSWORD = /type=(invite|recovery)/.test(INITIAL_HASH);
 /** The set-password page's own address. Invite emails return here (vercel.json rewrites it to the app). */
 const INVITE_PATH = "/invite/set-password";
 const INITIAL_PATH = typeof window !== "undefined" ? window.location.pathname : "/";
+/** The sign-in page's address. Each module has its own address too (see NAV). */
+const SIGNIN_PATH = "/sign-in";
+/* This tab is only here to set a password. Its session is kept in memory and never written to the browser's
+   storage, so it cannot replace or sign out an administrator who is signed in on the same computer. When it is
+   finished it reloads the sign-in page, which uses the normal, persistent session again. */
+const INVITE_TAB = INITIAL_PATH === INVITE_PATH || NEEDS_PASSWORD;
+const NOTICE_KEY = "oe-signin-notice"; // sessionStorage (this tab only): message for the sign-in page after a reload
+const handoffToSignIn = (notice) => {
+  try {
+    if (notice) sessionStorage.setItem(NOTICE_KEY, JSON.stringify(notice));
+  } catch (e) {
+    /* storage blocked: the sign-in page simply shows no message */
+  }
+  window.location.replace(SIGNIN_PATH + window.location.search);
+};
+const takeSignInNotice = () => {
+  try {
+    const raw = sessionStorage.getItem(NOTICE_KEY);
+    if (raw) sessionStorage.removeItem(NOTICE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+};
 // Supabase returns here with #error=...&error_code=otp_expired when an invite link is opened a second time or too late.
 const LINK_ERROR = /(^#|&)error=/.test(INITIAL_HASH) ? ((INITIAL_HASH.match(/error_code=([^&]*)/) || [])[1] || "error") : "";
 
@@ -899,6 +924,7 @@ function createDemoApi() {
       return { id: p.id };
     },
     async signOut() { me = null; },
+    async savePushSubscription() {}, async removePushSubscription() {}, async pushTest() {},
     async updatePassword() {},
     async getProfile() { return clone(profile() || null); },
     async getRoleLabel(role) { const r = db.roles.find((x) => x.role === role); return r ? r.label : role; },
@@ -1310,7 +1336,8 @@ function loadSupabase() {
   if (!_sbPromise)
     _sbPromise = Promise.resolve(
       createClient(CONFIG.supabaseUrl, CONFIG.supabaseAnonKey, {
-        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+        // The set-password tab keeps its session in memory only (see INVITE_TAB).
+        auth: { persistSession: !INVITE_TAB, autoRefreshToken: true, detectSessionInUrl: true },
       })
     );
   return _sbPromise;
@@ -1324,6 +1351,15 @@ function createSupabaseApi() {
   };
   const sb = () => loadSupabase();
   let userId = null;
+  // Push notifications go out through the oe-push function; a failure there never fails the action that caused it.
+  const notify = async (event, requestId) => {
+    try {
+      const c = await sb();
+      await c.functions.invoke("oe-push", { body: { event, request_id: requestId || null } });
+    } catch (e) {
+      /* best effort */
+    }
+  };
 
   return {
     mode: "live",
@@ -1526,16 +1562,21 @@ function createSupabaseApi() {
 
     async createRequest(r) {
       const c = await sb();
-      return ok(c.rpc("oe_create_request", {
+      const ref = await ok(c.rpc("oe_create_request", {
         p_request_date: r.request_date || null, p_project_id: r.project_id || null, p_date_needed: r.date_needed || null,
         p_remarks: r.remarks || null, p_lines: r.lines,
       }));
+      // tell the approvers (the function wants the id; the database returned the reference number)
+      const { data: row } = await c.from("oe_requests").select("id").eq("ref_no", ref).maybeSingle();
+      if (row) notify("submitted", row.id);
+      return ref;
     },
     async updateRequest(id, r) {
       const c = await sb();
       await ok(c.rpc("oe_update_request", {
         p_id: id, p_request_date: r.request_date || null, p_date_needed: r.date_needed || null, p_remarks: r.remarks || null, p_lines: r.lines,
       }));
+      notify("submitted", id); // an edit sends the request back for approval; the function checks that
       return null;
     },
     async withdrawRequest(id, remarks) { const c = await sb(); await ok(c.rpc("oe_withdraw_request", { p_id: id, p_remarks: remarks || null })); },
@@ -1544,8 +1585,29 @@ function createSupabaseApi() {
       // "amount" is the requested amount the approver saw; the database refuses the approval if it changed meanwhile.
       const p_lines = Object.entries(lineAmounts || {}).map(([lid, amt]) => ({ id: lid, approved_amount: amt, ...(seen && seen[lid] != null ? { amount: seen[lid] } : {}) }));
       await ok(c.rpc("oe_approve_request", { p_id: id, p_lines, p_remarks: remarks || null }));
+      notify("approved", id);
     },
-    async rejectRequest(id, remarks) { const c = await sb(); await ok(c.rpc("oe_reject_request", { p_id: id, p_remarks: remarks })); },
+    async rejectRequest(id, remarks) {
+      const c = await sb();
+      await ok(c.rpc("oe_reject_request", { p_id: id, p_remarks: remarks }));
+      notify("rejected", id);
+    },
+    async savePushSubscription(sub) {
+      const c = await sb();
+      await ok(
+        c.from("oe_push_subscriptions").upsert(
+          { user_id: userId, endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth, user_agent: sub.user_agent || null, last_seen_at: new Date().toISOString() },
+          { onConflict: "endpoint" }
+        )
+      );
+    },
+    async removePushSubscription(endpoint) {
+      const c = await sb();
+      await c.from("oe_push_subscriptions").delete().eq("endpoint", endpoint);
+    },
+    async pushTest() {
+      await notify("test", null);
+    },
     async setErpRef(id, ref) { const c = await sb(); await ok(c.rpc("oe_set_erp_ref", { p_id: id, p_erp_ref: ref })); },
     async disburseRequest(id, date, remarks) { const c = await sb(); await ok(c.rpc("oe_disburse_request", { p_id: id, p_date: date, p_remarks: remarks || null })); },
     async markPaid(items, date, remarks) {
@@ -1608,6 +1670,7 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe h1{font-size:22px;line-height:1.25}.oe h2{font-size:16px;line-height:1.35}.oe h3{font-size:14px}
 .oe p{margin:0}.oe .muted{color:var(--muted)}.oe .small{font-size:12.5px}.oe .num{font-variant-numeric:tabular-nums}
 .oe button,.oe input,.oe select,.oe textarea{font:inherit;color:inherit}
+.oe{-webkit-tap-highlight-color:transparent}
 .oe :focus-visible{outline:2px solid var(--teal);outline-offset:2px}
 .oe a{color:var(--teal-d)}
 .oe-shell{display:grid;grid-template-columns:248px minmax(0,1fr);min-height:100vh}
@@ -1623,11 +1686,36 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-me b{display:block;font-weight:500;color:#fff}.oe-me small{display:block;color:rgba(255,255,255,.64);font-size:12px}
 .oe-me button{margin-top:10px;display:inline-flex;align-items:center;gap:7px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:#fff;border-radius:7px;padding:5px 10px;cursor:pointer;font-size:12.5px}
 .oe-me button:hover{background:rgba(255,255,255,.18)}
+.oe-me-row{display:flex;flex-wrap:wrap;gap:0 8px}
 .oe-conf{display:flex;gap:7px;align-items:center;font-size:11.5px;color:rgba(255,255,255,.58);margin-top:14px}
+.oe-shell{transition:grid-template-columns .18s ease}
+.oe-side-toggle{display:flex;align-items:center;gap:9px;width:100%;margin-top:12px;border:0;border-top:1px solid rgba(255,255,255,.15);background:transparent;color:rgba(255,255,255,.7);padding:12px 10px 2px;cursor:pointer;font-size:12.5px;text-align:left}
+.oe-side-toggle:hover{color:#fff}
+.oe-brand .short{display:none}
+.oe-side-x{display:none}
+@media (min-width:768px){
+.oe-shell.collapsed{grid-template-columns:72px minmax(0,1fr)}
+.oe-shell.collapsed .oe-page{max-width:none}
+.collapsed .oe-side{padding-left:10px;padding-right:10px}
+.collapsed .oe-brand{padding:0 0 24px;text-align:center}.collapsed .oe-brand .full{display:none}.collapsed .oe-brand .short{display:block;font-size:15px}
+.collapsed .oe-nav{overflow-x:hidden}
+.collapsed .oe-nav button{position:relative;justify-content:center;padding:10px 0}
+.collapsed .oe-nav .lbl{display:none}
+.collapsed .oe-nav .badge{position:absolute;top:2px;right:4px;margin:0;font-size:10px;line-height:16px;min-width:16px;padding:0 4px}
+.collapsed .oe-me{padding:14px 0 0;text-align:center}
+.collapsed .oe-me b,.collapsed .oe-me small,.collapsed .oe-me .lbl{display:none}
+.collapsed .oe-me button{padding:7px 9px}
+.collapsed .oe-me-row{flex-direction:column;align-items:center;gap:0}
+.collapsed .oe-conf{justify-content:center}
+.collapsed .oe-side-toggle{justify-content:center;padding:12px 0 2px}.collapsed .oe-side-toggle .lbl{display:none}
+}
 .oe-main{min-width:0;display:flex;flex-direction:column}
 .oe-topbar{display:none}
 .oe-demo{background:var(--amber-bg);color:var(--amber);font-size:13px;padding:8px 28px;border-bottom:1px solid var(--line)}
+.oe-push{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 28px;background:var(--teal-50);border-bottom:1px solid var(--teal-100);color:var(--note-info);font-size:13.5px}
+.oe-push>div:not(.oe-actions){flex:1 1 280px;min-width:0}.oe-push b{display:block;color:var(--ink);font-weight:500}.oe-push p{margin-top:2px;font-size:12.5px}.oe-push>svg{flex:none;color:var(--teal-d)}
 .oe-page{padding:28px 28px 56px;width:100%;max-width:1480px}
+.oe-page.narrow{max-width:1360px}
 .oe-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
 .oe-head p{color:var(--muted);margin-top:4px;max-width:72ch}
 .oe-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -1708,6 +1796,24 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px 20px;margin:0}
 .oe-kv dt{font-size:12px;color:var(--muted)}.oe-kv dd{margin:2px 0 0;color:var(--ink);font-weight:500;overflow-wrap:anywhere}
 .oe-tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:18px;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
+.oe-hint{position:relative;display:inline-block;max-width:100%}.oe-meter-wrap{display:block}
+.oe-tip{position:absolute;left:0;top:calc(100% + 6px);z-index:40;background:var(--navy);color:#fff;font-size:12px;font-weight:400;line-height:1.4;padding:6px 9px;border-radius:7px;min-width:160px;max-width:260px;white-space:normal;box-shadow:0 8px 20px rgba(0,30,45,.25)}
+.oe-lf{display:contents}.oe-lf-t{display:none}.oe.oe .oe-phone-only{display:none}
+.oe-fold{margin-bottom:14px;border:1px solid var(--line);border-radius:var(--r);background:var(--surface)}
+.oe-fold>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:44px;padding:0 14px;font-weight:500;color:var(--ink)}
+.oe-fold>summary::-webkit-details-marker{display:none}
+.oe-fold>summary::after{content:"";width:8px;height:8px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(45deg);margin:0 4px 4px 0}
+.oe-fold[open]>summary::after{transform:rotate(-135deg);margin:4px 4px 0 0}
+.oe-fold .oe-filters{padding:4px 14px 14px;margin-bottom:0!important}
+.oe-fold .oe-filters>*{flex:1 1 100%;width:auto!important;max-width:none}
+.oe-fold .oe-filters .oe-select,.oe-fold .oe-filters .oe-input,.oe-fold .oe-search{width:100%;max-width:none}
+.oe-fold .oe-filters .oe-check{justify-content:space-between}
+.oe-kpi-more{justify-content:center;align-items:center;color:var(--teal-d);font-weight:500;font-size:13.5px}.oe-kpi-more::before{display:none}
+.oe-update{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:95;background:var(--navy);color:#fff;padding:10px 12px 10px 16px;border-radius:10px;display:flex;gap:12px;align-items:center;font-size:13.5px;box-shadow:0 12px 32px rgba(0,30,45,.28);max-width:calc(100vw - 32px)}
+.oe-update button{background:#fff;color:var(--navy);border:0;border-radius:7px;padding:8px 12px;font:inherit;font-weight:600;cursor:pointer}
+.oe-install{margin-top:12px;display:grid;gap:4px;font-size:12.5px;line-height:1.4;color:rgba(255,255,255,.8)}
+.oe-install button{margin-top:4px;justify-self:start}
+.collapsed .oe-install{display:none}
 .oe-tabs button{border:0;background:none;padding:9px 12px;color:var(--muted);font-weight:500;border-bottom:2px solid transparent;margin-bottom:-1px;cursor:pointer;white-space:nowrap;display:inline-flex;gap:7px;align-items:center}
 .oe-tabs button:hover{color:var(--ink)}.oe-tabs button[aria-selected=true]{color:var(--ink);border-color:var(--teal)}
 .oe-tabs .count{font-size:11.5px;background:var(--count);color:var(--slate);border-radius:999px;padding:0 7px;line-height:18px}
@@ -1886,14 +1992,8 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-lines-h{display:none}
 .oe-lgrid{grid-template-columns:28px repeat(3,minmax(0,1fr))}
 .oe-lgrid>.oe-line-no{grid-row:span 3}
-.oe-lgrid>input:nth-last-child(2){grid-column:span 2}
+.oe-lgrid>.oe-lf:nth-last-child(2)>*{grid-column:span 2}
 .oe-lsub{margin-left:36px}
-}
-@media (max-width:620px){
-.oe-lgrid{grid-template-columns:28px minmax(0,1fr) minmax(0,1fr)}
-.oe-lgrid>.oe-line-no{grid-row:span 4}
-.oe-lgrid>input:nth-last-child(2){grid-column:span 2}
-.oe-lsub{margin-left:0}
 }
 .oe-total{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:14px 18px;position:sticky;bottom:calc(12px + env(safe-area-inset-bottom,0px));box-shadow:0 8px 24px rgba(0,30,45,.08)}
 .oe-total b{font-size:20px;color:var(--ink);font-variant-numeric:tabular-nums}
@@ -1947,15 +2047,88 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-form .foot{margin-top:18px;font-size:10px;color:#666;display:flex;justify-content:space-between}
 @media print{body>*:not(.oe-print-root){display:none!important}.oe-print-root{display:block!important}@page{size:A4 portrait;margin:12mm}}
 @media (max-width:1100px){.oe-strip{grid-template-columns:repeat(3,minmax(0,1fr))}.oe-split{grid-template-columns:1fr}.oe-queue{position:static;max-height:none}}
-@media (max-width:960px){
+@media (max-width:767px){
 .oe-shell{grid-template-columns:1fr}
-.oe-side{position:fixed;inset:0 auto 0 0;width:270px;z-index:60;padding-top:calc(24px + env(safe-area-inset-top,0px));padding-bottom:calc(16px + env(safe-area-inset-bottom,0px));transform:translateX(-102%);transition:transform .2s ease}
+.oe-side{position:fixed;inset:0 auto 0 0;width:min(300px,86vw);z-index:60;padding-top:calc(24px + env(safe-area-inset-top,0px));padding-bottom:calc(16px + env(safe-area-inset-bottom,0px));transform:translateX(-102%);transition:transform .2s ease}
 .oe-side.open{transform:none}
+.oe-side-toggle{display:none}
 .oe-scrim{display:block;position:fixed;inset:0;background:rgba(0,20,30,.4);z-index:55}
 .oe-topbar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--navy);color:#fff;position:sticky;top:env(safe-area-inset-top,0px);z-index:40}
 .oe-topbar button{background:transparent;border:0;color:#fff;display:grid;place-items:center;width:36px;height:36px;border-radius:8px;cursor:pointer}
 .oe-page{padding:20px 16px 48px}.oe-demo{padding:8px 16px}
 .oe-signin{grid-template-columns:minmax(0,1fr);justify-items:center;align-content:center;gap:22px;padding:28px 16px calc(24px + env(safe-area-inset-bottom,0px))}.oe-signin-card{grid-column:1;width:100%;max-width:440px;padding:28px 22px 24px}.oe-signin-foot{position:static}
+/* phones: finger-sized controls, 16px fields (no iPhone zoom), notch and home-bar spacing */
+.oe-page{padding:20px max(16px,env(safe-area-inset-right,0px)) calc(48px + env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-left,0px))}
+.oe-push{padding:12px 16px}.oe-push .oe-actions{width:100%}.oe-push .oe-actions .oe-btn{flex:1 1 auto}
+.oe-side-x{display:grid;place-items:center;position:absolute;top:calc(10px + env(safe-area-inset-top,0px));right:8px;width:44px;height:44px;border:0;border-radius:8px;background:transparent;color:#fff;cursor:pointer}
+.oe .oe-input,.oe .oe-select,.oe .oe-textarea{font-size:16px;height:44px}
+.oe .oe-textarea{height:auto;min-height:88px}
+.oe-lsub .oe-input{height:44px}
+.oe .oe-btn{height:44px;font-size:14px}.oe .oe-btn.sm{height:40px}.oe-btn.icon{width:44px}.oe-btn.sm.icon{width:40px}
+.oe-doclink,.oe-file{min-height:40px;padding-top:4px;padding-bottom:4px}
+.oe-head .oe-actions{width:100%}.oe-head .oe-actions .oe-btn{flex:1 1 auto}
+.oe-tabs{flex-wrap:wrap;overflow:visible;gap:0 2px}
+.oe-tabs button{min-height:44px;padding:10px 12px}
+.oe input[type=checkbox],.oe input[type=radio]{width:22px;height:22px}
+.oe-check{min-height:44px}
+.oe-nav button{padding:12px 10px;font-size:15px}
+.oe-me button{padding:10px 14px;font-size:14px}
+.oe-topbar button{width:44px;height:44px}
+.oe-pass button{height:36px;padding:0 12px}.oe-pass .oe-input{padding-right:76px}
+.oe-file button,.oe-docx{min-width:36px;min-height:36px;display:inline-grid;place-items:center}
+.oe-demo-users button{min-height:56px}
+.oe-kpi{min-height:48px}
+.oe-combo-list li{padding:11px 10px;font-size:15px}
+.oe-bar-btn{padding:8px 6px;margin:-8px -6px}
+.oe-viewer-list button{min-height:44px}
+/* drawers and dialogs: close button top right, full width */
+.oe-drawer{width:100vw}
+.oe-drawer-h{flex-wrap:wrap;padding:10px 12px 12px 16px;gap:6px 8px}
+.oe-drawer-h>div:first-child{flex:1 1 100%;order:2}
+.oe-drawer-h .oe-actions{order:1;width:100%;justify-content:flex-end;flex-wrap:nowrap}
+.oe-drawer-b{padding:14px 16px 32px}
+.oe-modal{width:calc(100vw - 16px);max-height:calc(100vh - 16px)}
+.oe-modal-h{padding:16px 14px 10px 18px}.oe-modal-b{padding:4px 18px 16px}.oe-modal-f{padding:12px 14px}
+.oe-modal-f .oe-btn{flex:1 1 auto}
+/* tables: a pinned first column and scroll shadows; .cards tables become stacked cards */
+.oe-tablewrap,.oe-scrollx{overflow-x:auto;-webkit-overflow-scrolling:touch;background:linear-gradient(90deg,var(--surface) 30%,rgba(255,255,255,0)),linear-gradient(90deg,rgba(255,255,255,0),var(--surface) 70%) 100% 0,radial-gradient(farthest-side at 0 50%,rgba(0,30,45,.2),rgba(0,30,45,0)),radial-gradient(farthest-side at 100% 50%,rgba(0,30,45,.2),rgba(0,30,45,0)) 100% 0;background-color:var(--surface);background-repeat:no-repeat;background-size:40px 100%,40px 100%,14px 100%,14px 100%;background-attachment:local,local,scroll,scroll}
+.oe-tablewrap{max-height:none!important}
+.oe-table:not(.cards) th:first-child,.oe-table:not(.cards) td:first-child{position:sticky;left:0;z-index:2;background:var(--surface);box-shadow:1px 0 0 var(--line)}
+.oe-table:not(.cards) th:first-child{z-index:3;background:var(--sunk)}
+.oe-table:not(.cards) tfoot td:first-child{background:var(--sunk)}
+.oe-table:not(.cards) tr.grp td:first-child{background:var(--grp)}
+.oe-table:not(.cards) tr.sel td:first-child{background:var(--hover)}
+.oe-table:not(.cards) tr.focus td:first-child{background:var(--amber-bg)}
+.oe-table.cards,.oe-table.cards tbody,.oe-table.cards tfoot,.oe-table.cards tr{display:block}
+.oe-table.cards thead{display:none}
+.oe-table.cards tr{padding:10px 14px 12px;border-bottom:1px solid var(--line)}
+.oe-table.cards tbody tr:last-child{border-bottom:0}
+.oe-table.cards td{display:grid;grid-template-columns:minmax(92px,36%) minmax(0,1fr);gap:4px 10px;padding:5px 0;border:0;text-align:left;white-space:normal;min-width:0!important;max-width:none}
+.oe-table.cards td::before{content:attr(data-th);color:var(--muted);font-size:12.5px;line-height:1.5;padding-top:1px}
+.oe-table.cards td.lead{display:block;padding:0 0 6px}
+.oe-table.cards td.lead::before{display:none}
+.oe-table.cards td.none,.oe-table.cards td:empty{display:none}
+.oe-table.cards td.r,.oe-table.cards td.c{text-align:left}
+.oe-table.cards tr.grp td{display:block}
+.oe-table.cards tr.focus td{background:transparent}.oe-table.cards tr.focus{background:var(--amber-bg)}
+.oe-table.cards tfoot tr{background:var(--sunk);border-top:1px solid var(--line)}
+.oe-table.cards tfoot td{font-weight:600;color:var(--ink)}
+.oe-table.cards .oe-chip.status{width:auto}
+.oe-table.cards .oe-usage{min-width:0}
+.oe-table.cards .oe-clip{max-width:none;white-space:normal}
+.oe-table.cards td .oe-input{max-width:220px}
+/* approvals: approve and reject stay in reach; new request: labelled line fields and a bottom bar */
+.oe-approve-bar{position:sticky;bottom:0;z-index:3;background:var(--surface);margin:0 -18px -16px;padding:10px 18px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line)}
+.oe-approve-bar .oe-btn{flex:1 1 auto}
+.oe-lgrid{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px 8px}
+.oe-lgrid>.oe-line-no{grid-column:1;grid-row:1}
+.oe-lgrid>.oe-lrow-act{grid-column:2;grid-row:1;justify-content:flex-end}
+.oe-lgrid>.oe-lf:nth-child(2),.oe-lgrid>.oe-lf:nth-child(7){grid-column:span 2}
+.oe-lf{display:flex;flex-direction:column;gap:4px;min-width:0}
+.oe-lf-t{display:block;font-size:12.5px;font-weight:500;color:var(--slate)}
+.oe-lsub{margin-left:0}
+.oe.oe .oe-phone-only{display:flex}
+.oe-total{padding:12px 16px}.oe-total .oe-btn{flex:1 1 auto}
 }
 @media (max-width:760px){.oe-grid>*{grid-column:span 12!important}.oe-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.oe-strip>div:nth-child(odd){border-left:0}.oe-search{max-width:none}}
 @media (prefers-reduced-motion:reduce){.oe-drawer,.oe-modal,.oe-toast,.oe-modal.nudge,.oe-drawer.nudge,.oe-topo,.oe-signin-card{animation:none}.oe *{transition:none!important}}
@@ -1980,6 +2153,9 @@ const ICONS = {
   ),
   logout: <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />,
   menu: <path d="M3 6h18M3 12h18M3 18h18" />,
+  bell: <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0" />,
+  collapse: <path d="m11 17-5-5 5-5M18 17l-5-5 5-5" />,
+  expand: <path d="m13 17 5-5-5-5M6 17l5-5-5-5" />,
   x: <path d="M18 6 6 18M6 6l12 12" />,
   copy: (
     <>
@@ -2029,6 +2205,64 @@ function Icon({ name, size = 18 }) {
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
       {ICONS[name]}
     </svg>
+  );
+}
+
+/* Screen sizes. PHONE_QUERY is the phone layout in the stylesheet (slide-out menu, stacked tables, 16px fields);
+   TABLET_QUERY is the band where the side panel is always the icon strip. */
+const PHONE_QUERY = "(max-width:767px)";
+const TABLET_QUERY = "(min-width:768px) and (max-width:960px)";
+function useMediaQuery(query) {
+  const read = () => (typeof window !== "undefined" && window.matchMedia ? window.matchMedia(query).matches : false);
+  const [matches, setMatches] = useState(read);
+  useEffect(() => {
+    if (!(typeof window !== "undefined" && window.matchMedia)) return undefined;
+    const mq = window.matchMedia(query);
+    const on = () => setMatches(mq.matches);
+    on();
+    if (mq.addEventListener) mq.addEventListener("change", on);
+    else mq.addListener(on);
+    return () => (mq.removeEventListener ? mq.removeEventListener("change", on) : mq.removeListener(on));
+  }, [query]);
+  return matches;
+}
+const useIsPhone = () => useMediaQuery(PHONE_QUERY);
+
+/** Text a mouse shows on hover; a tap shows it under the element, since touch screens have no hover. */
+function TapHint({ hint, children, className = "" }) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return undefined;
+    const t = setTimeout(() => setOpen(false), 4000);
+    return () => clearTimeout(t);
+  }, [open]);
+  if (!hint) return <span className={className}>{children}</span>;
+  return (
+    <span className={`oe-hint ${className}`} title={hint} onClick={() => setOpen((v) => !v)}>
+      {children}
+      {open && (
+        <span className="oe-tip" role="status">
+          {hint}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** Filter row. On a phone it folds behind a "Filters" bar so the list starts near the top of the screen. */
+function Filters({ children, style }) {
+  const phone = useIsPhone();
+  const row = (
+    <div className={"oe-filters"} style={style}>
+      {children}
+    </div>
+  );
+  if (!phone) return row;
+  return (
+    <details className="oe-fold">
+      <summary>Filters and search</summary>
+      {row}
+    </details>
   );
 }
 
@@ -2101,11 +2335,11 @@ function Chip({ tone = "muted", children, plain, className = "", title }) {
 function StatusChip({ status }) {
   const s = STATUS[status] || { label: status, tone: "muted" };
   return (
-    <span title={s.hint}>
+    <TapHint hint={s.hint}>
       <Chip tone={s.tone} className="status">
         {s.label}
       </Chip>
-    </span>
+    </TapHint>
   );
 }
 
@@ -2132,11 +2366,13 @@ function Meter({ alloc, used, pending = 0, near = 90, size = "" }) {
   const state = alloc <= 0 ? (used > 0 ? "over" : "") : used > alloc + 0.004 ? "over" : used >= (alloc * near) / 100 ? "near" : "";
   const label = alloc > 0 ? `${money(used)} of ${money(alloc)} used${pending ? `, ${money(pending)} in approval` : ""}` : `${money(used)} used, no allocation`;
   return (
-    <div className={`oe-meter ${state} ${size}`} role="img" aria-label={label} title={label}>
-      <div className="used" style={{ width: usedW + "%" }} />
-      {pendW > 0 && <div className="pend" style={{ left: usedW + "%", width: pendW + "%" }} />}
-      {alloc > 0 && used + pending > alloc + 0.004 && <div className="tick" style={{ left: `calc(${(alloc / scale) * 100}% - 1px)` }} />}
-    </div>
+    <TapHint hint={label} className="oe-meter-wrap">
+      <div className={`oe-meter ${state} ${size}`} role="img" aria-label={label}>
+        <div className="used" style={{ width: usedW + "%" }} />
+        {pendW > 0 && <div className="pend" style={{ left: usedW + "%", width: pendW + "%" }} />}
+        {alloc > 0 && used + pending > alloc + 0.004 && <div className="tick" style={{ left: `calc(${(alloc / scale) * 100}% - 1px)` }} />}
+      </div>
+    </TapHint>
   );
 }
 
@@ -3029,7 +3265,7 @@ function ReportPage() {
           <dd className={totals.flagged ? "bad" : ""}>{totals.flagged}</dd>
         </div>
       </dl>
-      <div className="oe-filters">
+      <Filters>
         <SearchBox value={f.q} onChange={set("q")} placeholder="Search project ID, name or location" />
         <select className="oe-select" value={f.year} onChange={set("year")} aria-label="Year">
           <option value="">All years</option>
@@ -3069,14 +3305,14 @@ function ReportPage() {
           <option value="usage">Highest usage first</option>
           <option value="flags">Most limits exceeded</option>
         </select>
-      </div>
+      </Filters>
       {rows.length === 0 ? (
         <div className="oe-panel">
           <Empty title="No projects match these filters" body="Clear a filter or search for a different project ID." />
         </div>
       ) : (
         <div className="oe-tablewrap" style={{ maxHeight: "calc(100vh - 290px)" }}>
-          <table className="oe-table">
+          <table className="oe-table cards">
             <thead>
               <tr>
                 <th>Project</th>
@@ -3090,7 +3326,7 @@ function ReportPage() {
             <tbody>
               {rows.map(({ p, s, t, over, unbudgeted }) => (
                 <tr key={p.id} className="click" tabIndex={0} onClick={() => setOpenId(p.id)} onKeyDown={(e) => e.key === "Enter" && setOpenId(p.id)}>
-                  <td>
+                  <td className="lead">
                     <span className="oe-code">{p.code}</span>
                     <span className="sub oe-clip" title={p.name}>
                       {p.name}
@@ -3107,16 +3343,16 @@ function ReportPage() {
                       )}
                     </span>
                   </td>
-                  <td className="r">{contractBase(p) ? compact(contractBase(p)) : "—"}</td>
+                  <td className="r" data-th="Contract value">{contractBase(p) ? compact(contractBase(p)) : "—"}</td>
                   {cols.map((c) => {
                     const v = c.get(s);
                     return (
-                      <td key={c.id}>
+                      <td key={c.id} data-th={c.label}>
                         <UsageCell alloc={v.alloc} used={v.used} pending={v.pending} near={near} />
                       </td>
                     );
                   })}
-                  <td>
+                  <td data-th={scopeCat ? `${(idx.cats.get(scopeCat) || {}).name} total` : "Total"}>
                     <UsageCell alloc={t.alloc} used={t.used} pending={t.pending} near={near} />
                   </td>
                 </tr>
@@ -3124,14 +3360,14 @@ function ReportPage() {
             </tbody>
             <tfoot>
               <tr>
-                <td>{rows.length} projects</td>
-                <td className="r">{compact(rows.reduce((a, { p }) => a + contractBase(p), 0))}</td>
+                <td className="lead">{rows.length} projects</td>
+                <td className="r" data-th="Contract value">{compact(rows.reduce((a, { p }) => a + contractBase(p), 0))}</td>
                 {colTotals.map((v, i) => (
-                  <td key={cols[i].id}>
+                  <td key={cols[i].id} data-th={cols[i].label}>
                     <UsageCell alloc={v.alloc} used={v.used} pending={v.pending} near={near} />
                   </td>
                 ))}
-                <td>
+                <td data-th="Total">
                   <UsageCell alloc={totals.alloc} used={totals.used} pending={totals.pending} near={near} />
                 </td>
               </tr>
@@ -3192,7 +3428,7 @@ function ProjectBreakdown({ project, focus }) {
           <Meter alloc={s.total.alloc} used={s.total.used} pending={s.total.pending} near={near} size="lg" />
           {s.total.pending > 0 && <span className="muted small">{money(s.total.pending)} waiting for approval</span>}
         </div>
-        <div style={{ overflowX: "auto", borderTop: "1px solid var(--line)" }}>
+        <div className="oe-scrollx" style={{ borderTop: "1px solid var(--line)" }}>
           <table className="oe-table tight">
             <thead>
               <tr>
@@ -3277,7 +3513,7 @@ function ProjectBreakdown({ project, focus }) {
         {lines.length === 0 ? (
           <Empty title="No request lines yet" body="Lines filed against this project will appear here." />
         ) : (
-          <div style={{ overflowX: "auto" }}>
+          <div className="oe-scrollx">
             <table className="oe-table tight">
               <thead>
                 <tr>
@@ -3370,7 +3606,7 @@ function ProjectsPage() {
           </Button>
         )}
       </PageHead>
-      <div className="oe-filters">
+      <Filters>
         <SearchBox value={f.q} onChange={set("q")} placeholder="Search ID, name, location, engineer" />
         <select className="oe-select" value={f.year} onChange={set("year")} aria-label="Year">
           <option value="">All years</option>
@@ -3391,7 +3627,7 @@ function ProjectsPage() {
           ))}
         </select>
         <span className="muted small">{rows.length} projects</span>
-      </div>
+      </Filters>
       {rows.length === 0 ? (
         <div className="oe-panel">
           <Empty
@@ -3403,7 +3639,7 @@ function ProjectsPage() {
       ) : (
         <>
           <div className="oe-tablewrap">
-            <table className="oe-table">
+            <table className="oe-table cards">
               <thead>
                 <tr>
                   <th>Project ID</th>
@@ -3420,26 +3656,26 @@ function ProjectsPage() {
               <tbody>
                 {shown.map((p) => (
                   <tr key={p.id} className="click" tabIndex={0} onClick={() => setOpenId(p.id)} onKeyDown={(e) => e.key === "Enter" && setOpenId(p.id)}>
-                    <td>
+                    <td className="lead">
                       <span className="oe-code">{p.code}</span>
                       <span className="sub">{p.year || ""}</span>
                     </td>
-                    <td>
+                    <td data-th="Project name">
                       <span className="oe-clip" title={p.name}>
                         {p.name}
                       </span>
                       <span className="sub">{p.location}</span>
                     </td>
-                    <td>{p.district || "—"}</td>
-                    <td>{p.category || "—"}</td>
-                    <td>{p.contractor || "—"}</td>
-                    <td className="r">{contractBase(p) ? money(contractBase(p)) : "—"}</td>
-                    <td>{fmtDate(p.ntp_date)}</td>
-                    <td>
+                    <td data-th="District">{p.district || "—"}</td>
+                    <td data-th="Category">{p.category || "—"}</td>
+                    <td data-th="Contractor / JV">{p.contractor || "—"}</td>
+                    <td className="r" data-th="Contract value">{contractBase(p) ? money(contractBase(p)) : "—"}</td>
+                    <td data-th="NTP date">{fmtDate(p.ntp_date)}</td>
+                    <td data-th="Status">
                       {p.status || "—"}
                       {p.status_group && p.status_group !== p.status && <span className="sub">{p.status_group}</span>}
                     </td>
-                    <td className="r">{p.accomplishment != null ? pct(p.accomplishment) : "—"}</td>
+                    <td className="r" data-th="Accomplishment">{p.accomplishment != null ? pct(p.accomplishment) : "—"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -3710,7 +3946,7 @@ function AllocationEditor({ project, initial, draft, setDraft }) {
           </div>
         )}
       </div>
-      <div style={{ overflowX: "auto" }}>
+      <div className="oe-scrollx">
         <table className="oe-table tight">
           <thead>
             <tr>
@@ -3918,7 +4154,7 @@ function PayDaysAnalysis() {
       <p className="muted" style={{ maxWidth: "80ch" }}>
         Days from the date accounting disbursed the fund to the date the liaison marked the line as given to the client. Lines not yet given are counted up to today.
       </p>
-      <div className="oe-filters" style={{ marginBottom: 0 }}>
+      <Filters style={{ marginBottom: 0 }}>
         <label className="oe-check small">
           Disbursed from <input className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
         </label>
@@ -3940,7 +4176,7 @@ function PayDaysAnalysis() {
         <Button icon="download" onClick={exportCSV} disabled={!rows.length}>
           Export CSV
         </Button>
-      </div>
+      </Filters>
 
       <dl className="oe-strip" style={{ marginBottom: 0 }}>
         <div>
@@ -4001,7 +4237,7 @@ function PayDaysAnalysis() {
                 <p className="muted small">Sorted by the longest wait still open</p>
               </div>
             </div>
-            <div style={{ overflowX: "auto" }}>
+            <div className="oe-scrollx">
               <table className="oe-table">
                 <thead>
                   <tr>
@@ -4046,7 +4282,7 @@ function PayDaysAnalysis() {
             {unpaid.length === 0 ? (
               <Empty title="Nothing waiting" body="Every disbursed line in this period has been given to the client." />
             ) : (
-              <div style={{ overflowX: "auto" }}>
+              <div className="oe-scrollx">
                 <table className="oe-table">
                   <thead>
                     <tr>
@@ -4210,7 +4446,7 @@ function DisbDaysAnalysis() {
       <p className="muted" style={{ maxWidth: "80ch" }}>
         Days from the request date to the date accounting disbursed the fund, split into approval, ERP reference and disbursement. Requests not yet disbursed are counted up to today.
       </p>
-      <div className="oe-filters" style={{ marginBottom: 0 }}>
+      <Filters style={{ marginBottom: 0 }}>
         <label className="oe-check small">
           Requested from <input className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
         </label>
@@ -4232,7 +4468,7 @@ function DisbDaysAnalysis() {
         <Button icon="download" onClick={exportCSV} disabled={!done.length && !pending.length}>
           Export CSV
         </Button>
-      </div>
+      </Filters>
 
       <dl className="oe-strip" style={{ marginBottom: 0 }}>
         <div>
@@ -4315,7 +4551,7 @@ function DisbDaysAnalysis() {
                 <p className="muted small">The ERP reference step is the part the liaison controls</p>
               </div>
             </div>
-            <div style={{ overflowX: "auto" }}>
+            <div className="oe-scrollx">
               <table className="oe-table">
                 <thead>
                   <tr>
@@ -4353,7 +4589,7 @@ function DisbDaysAnalysis() {
             {pending.length === 0 ? (
               <Empty title="Nothing waiting" body="Every approved request in this period has been disbursed." />
             ) : (
-              <div style={{ overflowX: "auto" }}>
+              <div className="oe-scrollx">
                 <table className="oe-table">
                   <thead>
                     <tr>
@@ -4559,7 +4795,7 @@ function ExpenseAnalysis() {
       <p className="muted" style={{ maxWidth: "80ch" }}>
         Which expense categories and types carry the most amount. Amounts filed under FOR-ASSIGNMENT or ADVANCES follow any reclassification when you filter by project.
       </p>
-      <div className="oe-filters" style={{ marginBottom: 0 }}>
+      <Filters style={{ marginBottom: 0 }}>
         <label className="oe-check small">
           Request date from <input className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
         </label>
@@ -4580,7 +4816,7 @@ function ExpenseAnalysis() {
         <Button icon="download" onClick={exportCSV} disabled={!byType.length}>
           Export CSV
         </Button>
-      </div>
+      </Filters>
 
       <dl className="oe-strip" style={{ marginBottom: 0 }}>
         <div>
@@ -4680,7 +4916,7 @@ function ExpenseAnalysis() {
                 </p>
               </div>
             </div>
-            <div style={{ overflowX: "auto" }}>
+            <div className="oe-scrollx">
               <table className="oe-table">
                 <thead>
                   <tr>
@@ -4739,7 +4975,7 @@ function ExpenseAnalysis() {
                   Close
                 </Button>
               </div>
-              <div style={{ overflowX: "auto" }}>
+              <div className="oe-scrollx">
                 <table className="oe-table tight">
                   <thead>
                     <tr>
@@ -5052,7 +5288,7 @@ function NewRequestPage({ params }) {
     );
 
   return (
-    <div className="oe-page" style={{ maxWidth: 1360 }}>
+    <div className="oe-page narrow">
       <PageHead
         title={editing ? `Edit ${editing.ref_no}` : "New request"}
         desc={
@@ -5204,6 +5440,16 @@ function NewRequestPage({ params }) {
               Add line
             </Button>
           </div>
+        </div>
+        {/* phones: the total and the submit button stay in reach at the bottom of a long form */}
+        <div className="oe-total oe-phone-only">
+          <span>
+            <span className="muted small" style={{ display: "block" }}>Request total</span>
+            <b className="num">{money(total)}</b>
+          </span>
+          <Button variant="primary" busy={busy} onClick={submit}>
+            {editing ? "Save changes" : "Submit request"}
+          </Button>
         </div>
 
       </div>
@@ -5432,7 +5678,17 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
     <div className={`oe-lrow ${bad ? "bad" : ""}`} role="group" aria-label={`Line ${n}`}>
       <div className="oe-lgrid">
         <span className="oe-line-no">{n}</span>
-        <ProjectPicker projects={data.projects} value={l.project_id} onChange={(id) => onChange({ project_id: id })} invalid={!!errors.project_id} label={`Line ${n} project ID`} />
+        {/* .oe-lf wrappers show a label on phones and disappear from the layout on wider screens */}
+        <span className="oe-lf">
+          <span className="oe-lf-t" aria-hidden="true">
+            Project ID <span className="oe-req">*</span>
+          </span>
+          <ProjectPicker projects={data.projects} value={l.project_id} onChange={(id) => onChange({ project_id: id })} invalid={!!errors.project_id} label={`Line ${n} project ID`} />
+        </span>
+        <span className="oe-lf">
+        <span className="oe-lf-t" aria-hidden="true">
+          Category <span className="oe-req">*</span>
+        </span>
         <select
           className={`oe-select ${errors.category_id ? "bad" : ""} ${l.category_id ? "" : "empty"}`}
           aria-label={`Line ${n} category`}
@@ -5448,6 +5704,11 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
             </option>
           ))}
         </select>
+        </span>
+        <span className="oe-lf">
+        <span className="oe-lf-t" aria-hidden="true">
+          Expense type <span className="oe-req">*</span>
+        </span>
         <select
           className={`oe-select ${errors.type_id ? "bad" : ""} ${l.type_id ? "" : "empty"}`}
           aria-label={`Line ${n} expense type`}
@@ -5464,6 +5725,11 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
             </option>
           ))}
         </select>
+        </span>
+        <span className="oe-lf">
+        <span className="oe-lf-t" aria-hidden="true">
+          Amount (₱) <span className="oe-req">*</span>
+        </span>
         <MoneyInput
           className={errors.amount || (method === "contract_pct" && calc != null && amountNow > calc + 0.004) ? "bad" : ""}
           value={l.amount}
@@ -5472,8 +5738,19 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
           aria-label={`Line ${n} amount`}
           title={method === "contract_pct" && calc != null ? `Calculated automatically; you can lower it, up to ${money(calc)}` : undefined}
         />
-        <input className={`oe-input ${errors.payee ? "bad" : ""}`} value={l.payee} onChange={(e) => onChange({ payee: e.target.value })} placeholder="Payee" aria-label={`Line ${n} payee`} aria-required="true" />
-        <input className="oe-input" value={l.description} onChange={(e) => onChange({ description: e.target.value })} placeholder="Optional" aria-label={`Line ${n} remarks`} />
+        </span>
+        <span className="oe-lf">
+          <span className="oe-lf-t" aria-hidden="true">
+            Payee / recipient <span className="oe-req">*</span>
+          </span>
+          <input className={`oe-input ${errors.payee ? "bad" : ""}`} value={l.payee} onChange={(e) => onChange({ payee: e.target.value })} placeholder="Payee" aria-label={`Line ${n} payee`} aria-required="true" />
+        </span>
+        <span className="oe-lf">
+          <span className="oe-lf-t" aria-hidden="true">
+            Remarks
+          </span>
+          <input className="oe-input" value={l.description} onChange={(e) => onChange({ description: e.target.value })} placeholder="Optional" aria-label={`Line ${n} remarks`} />
+        </span>
         <span className="oe-lrow-act">
           <input ref={fileRef} type="file" accept={DOC_ACCEPT} multiple hidden onChange={pickFiles} />
           <Button
@@ -5744,9 +6021,9 @@ function ApprovalDetail({ request: r }) {
             <Note>{r.remarks}</Note>
           </div>
         )}
-        <div style={{ overflowX: "auto", borderTop: r.remarks ? "1px solid var(--line)" : 0, marginTop: r.remarks ? 16 : 0 }}>
+        <div className="oe-scrollx" style={{ borderTop: r.remarks ? "1px solid var(--line)" : 0, marginTop: r.remarks ? 16 : 0 }}>
           <div>
-            <table className="oe-table tight">
+            <table className="oe-table tight cards">
               <thead>
                 <tr>
                   <th>#</th>
@@ -5765,8 +6042,8 @@ function ApprovalDetail({ request: r }) {
                   const c = checks[i];
                   return (
                     <tr key={l.id}>
-                      <td>{l.line_no}</td>
-                      <td style={{ minWidth: 200 }}>
+                      <td data-th="Line">{l.line_no}</td>
+                      <td className="lead" style={{ minWidth: 200 }}>
                         {p ? (
                           <button
                             type="button"
@@ -5801,9 +6078,9 @@ function ApprovalDetail({ request: r }) {
                           </span>
                         )}
                       </td>
-                      <td className="oe-particulars">{l.description || ""}</td>
-                      <td className="r">{money(l.amount)}</td>
-                      <td style={{ minWidth: 170 }}>
+                      <td className="oe-particulars" data-th="Particulars">{l.description || ""}</td>
+                      <td className="r" data-th="Requested">{money(l.amount)}</td>
+                      <td style={{ minWidth: 170 }} data-th="Limit check">
                         {c ? (
                           <div className="oe-usage">
                             <div className="oe-usage-t">
@@ -5820,13 +6097,13 @@ function ApprovalDetail({ request: r }) {
                           "—"
                         )}
                       </td>
-                      <td className="r">
+                      <td className="r" data-th="Balance after">
                         <b style={{ color: c && c.balanceAfter < -0.004 ? "var(--red)" : "var(--ink)" }}>{c ? money(c.balanceAfter) : "—"}</b>
                         <div style={{ marginTop: 4 }}>
                           <LimitChip state={c && c.state} over={c ? -c.balanceAfter : 0} />
                         </div>
                       </td>
-                      <td>
+                      <td data-th="Approve amount">
                         <MoneyInput value={amounts[l.id]} onChange={(v) => setAmounts((a) => ({ ...a, [l.id]: v }))} aria-label={`Approve amount for line ${l.line_no}`} />
                       </td>
                     </tr>
@@ -5835,10 +6112,12 @@ function ApprovalDetail({ request: r }) {
               </tbody>
               <tfoot>
                 <tr>
-                  <td colSpan={3}>Total</td>
-                  <td className="r">{money(reqRequested(r))}</td>
-                  <td colSpan={2} />
-                  <td className="r">{money(approvedTotal)}</td>
+                  <td colSpan={3} className="lead">
+                    Total
+                  </td>
+                  <td className="r" data-th="Requested">{money(reqRequested(r))}</td>
+                  <td colSpan={2} className="none" />
+                  <td className="r" data-th="Approved">{money(approvedTotal)}</td>
                 </tr>
               </tfoot>
             </table>
@@ -5856,7 +6135,7 @@ function ApprovalDetail({ request: r }) {
           <Field label="Approval remarks" hint="Optional; saved with the request">
             <textarea className="oe-textarea" value={remarks} onChange={(e) => setRemarks(e.target.value)} />
           </Field>
-          <div className="oe-actions" style={{ justifyContent: "flex-end" }}>
+          <div className="oe-actions oe-approve-bar" style={{ justifyContent: "flex-end" }}>
             <Button variant="danger" onClick={reject} disabled={busy}>
               Reject
             </Button>
@@ -5901,6 +6180,10 @@ function RequestsPage({ params }) {
   const [openId, setOpenId] = useState((params && params.requestId) || null);
   const [page, setPage] = useState(1);
   const PER = 30;
+  // phones: three status cards (needs my action, all, the one picked) until "All statuses" is tapped
+  const phone = useIsPhone();
+  const [allCards, setAllCards] = useState(false);
+  const cards = phone && !allCards ? KPI_CARDS.filter((c) => c.id === "action" || c.id === "all" || c.id === status) : KPI_CARDS;
 
   const enriched = useMemo(() => data.requests.map((r) => ({ r, step: nextStep(r, me, can, idx), shown: displayStatus(r, idx) })), [data.requests, me, can, idx]);
   const matchesFilters = useCallback(
@@ -5987,7 +6270,7 @@ function RequestsPage({ params }) {
         </Button>
       </PageHead>
       <div className="oe-kpis" role="group" aria-label="Filter by status">
-        {KPI_CARDS.map((c) => (
+        {cards.map((c) => (
           <button
             key={c.id}
             type="button"
@@ -6003,8 +6286,13 @@ function RequestsPage({ params }) {
             </span>
           </button>
         ))}
+        {phone && (
+          <button type="button" className="oe-kpi oe-kpi-more" onClick={() => setAllCards((v) => !v)} aria-expanded={allCards}>
+            <span className="k-label">{allCards ? "Fewer statuses" : `All ${KPI_CARDS.length} statuses`}</span>
+          </button>
+        )}
       </div>
-      <div className="oe-filters">
+      <Filters>
         <SearchBox value={f.q} onChange={set("q")} placeholder="Search reference, ERP ref, project, payee" />
         {seeAll && (
           <select className="oe-select" value={f.requester} onChange={set("requester")} aria-label="Requested by">
@@ -6026,7 +6314,7 @@ function RequestsPage({ params }) {
         <label className="oe-check small">
           To <input className="oe-input" type="date" value={f.to} onChange={set("to")} style={{ width: 150 }} />
         </label>
-      </div>
+      </Filters>
       {rows.length === 0 ? (
         <div className="oe-panel">
           <Empty
@@ -6042,7 +6330,7 @@ function RequestsPage({ params }) {
       ) : (
         <>
           <div className="oe-tablewrap">
-            <table className="oe-table">
+            <table className="oe-table cards">
               <thead>
                 <tr>
                   <th>Reference</th>
@@ -6061,34 +6349,34 @@ function RequestsPage({ params }) {
                   const codes = [...new Set(r.lines.map((l) => (idx.projects.get(l.project_id) || {}).code).filter(Boolean))];
                   return (
                     <tr key={r.id} className="click" tabIndex={0} onClick={() => setOpenId(r.id)} onKeyDown={(e) => e.key === "Enter" && setOpenId(r.id)}>
-                      <td>
+                      <td className="lead">
                         <span className="oe-code">{r.ref_no}</span>
                         <span className="sub">
                           {r.lines.length} {r.lines.length === 1 ? "line" : "lines"}
                         </span>
                       </td>
-                      <td>{fmtDate(r.request_date)}</td>
-                      <td>{r.liaison_name}</td>
-                      <td>
+                      <td data-th="Request date">{fmtDate(r.request_date)}</td>
+                      <td data-th="Liaison">{r.liaison_name}</td>
+                      <td data-th="Projects">
                         {codes[0] || "—"}
                         {codes.length > 1 && <span className="sub">and {codes.length - 1} more</span>}
                       </td>
-                      <td className="r">{money(reqTotal(r))}</td>
-                      <td>{r.erp_ref || <span className="muted">—</span>}</td>
-                      <td>{r.disbursed_date ? fmtDate(r.disbursed_date) : <span className="muted">—</span>}</td>
-                      <td>
+                      <td className="r" data-th="Amount">{money(reqTotal(r))}</td>
+                      <td data-th="ERP reference">{r.erp_ref || <span className="muted">—</span>}</td>
+                      <td data-th="Disbursed">{r.disbursed_date ? fmtDate(r.disbursed_date) : <span className="muted">—</span>}</td>
+                      <td data-th="Status">
                         <StatusChip status={displayStatus(r, idx)} />
                         {(() => {
                           const since = statusSince(r, displayStatus(r, idx));
                           const n = daysSince(since);
                           return n == null ? null : (
-                            <span className="sub oe-since" title={`In this status since ${fmtDate(since)}`}>
+                            <TapHint hint={`In this status since ${fmtDate(since)}`} className="sub oe-since">
                               {n === 0 ? "since today" : `${daysLabel(n)}`}
-                            </span>
+                            </TapHint>
                           );
                         })()}
                       </td>
-                      <td style={{ color: step.mine ? "var(--teal-d)" : "var(--muted)", fontWeight: step.mine ? 600 : 400 }}>{step.text}</td>
+                      <td data-th="Next step" style={{ color: step.mine ? "var(--teal-d)" : "var(--muted)", fontWeight: step.mine ? 600 : 400 }}>{step.text}</td>
                     </tr>
                   );
                 })}
@@ -6647,8 +6935,8 @@ function RequestDrawer({ requestId, onClose }) {
             </label>
           )}
         </div>
-        <div style={{ overflowX: "auto" }}>
-          <table className="oe-table tight">
+        <div className="oe-scrollx">
+          <table className="oe-table tight cards">
             <thead>
               <tr>
                 {selectableIds.length > 0 && <th aria-label="Select" />}
@@ -6670,10 +6958,10 @@ function RequestDrawer({ requestId, onClose }) {
                 return (
                   <tr key={l.id} className={sel.has(l.id) ? "sel" : ["declined", "rejected", "cancelled", "returned"].includes(l.status) ? "muted-row" : ""}>
                     {selectableIds.length > 0 && (
-                      <td>{selectable(l) && <input type="checkbox" checked={sel.has(l.id)} onChange={() => toggle(l.id)} aria-label={`Select line ${l.line_no}`} />}</td>
+                      <td data-th="Select">{selectable(l) && <input type="checkbox" checked={sel.has(l.id)} onChange={() => toggle(l.id)} aria-label={`Select line ${l.line_no}`} />}</td>
                     )}
-                    <td>{l.line_no}</td>
-                    <td style={{ minWidth: 240 }}>
+                    <td data-th="Line">{l.line_no}</td>
+                    <td className="lead" style={{ minWidth: 240 }}>
                       <span className="oe-code">{p ? p.code : "?"}</span> {c ? c.name : ""}: {t ? t.name : "?"}
                       {(l.reclass || []).length > 0 && (
                         <>
@@ -6754,17 +7042,17 @@ function RequestDrawer({ requestId, onClose }) {
                         </div>
                       )}
                     </td>
-                    <td className="oe-particulars">{l.description || ""}</td>
-                    <td className="r">{money(l.amount)}</td>
-                    <td className="r">{l.approved_amount != null ? money(l.approved_amount) : "—"}</td>
-                    <td>
+                    <td className="oe-particulars" data-th="Particulars">{l.description || ""}</td>
+                    <td className="r" data-th="Requested">{money(l.amount)}</td>
+                    <td className="r" data-th="Approved">{l.approved_amount != null ? money(l.approved_amount) : "—"}</td>
+                    <td data-th="Status">
                       <StatusChip status={l.status} />
                     </td>
-                    <td style={{ whiteSpace: "nowrap" }}>
+                    <td style={{ whiteSpace: "nowrap" }} data-th="Paid">
                       {l.paid_date ? fmtDate(l.paid_date) : "—"}
                       {l.paid_date && (lineReturned(l) > 0 || l.status === "part_paid") && <span className="sub num">{money(linePaid(l))} given</span>}
                     </td>
-                    <td className="small" style={{ whiteSpace: "nowrap" }}>
+                    <td className="small" style={{ whiteSpace: "nowrap" }} data-th="Verified">
                       {l.status === "returned" ? (
                         <span className="muted">Not needed (returned)</span>
                       ) : l.status === "part_paid" ? (
@@ -7528,7 +7816,7 @@ function ExpenseSetup() {
             {types.length === 0 ? (
               <Empty title="No expense types yet" body="Add the first type for this category." />
             ) : (
-              <div style={{ overflowX: "auto" }}>
+              <div className="oe-scrollx">
                 <table className="oe-table tight" style={{ tableLayout: "fixed", minWidth: 1120 }}>
                   <colgroup>
                     {[15, 6, 21, 14, 6, 10, 10, 8, 10].map((w, i) => (
@@ -7777,13 +8065,13 @@ function AcumaticaMapping() {
             </p>
           </div>
         </div>
-        <div className="oe-filters" style={{ marginBottom: 12 }}>
+        <Filters style={{ marginBottom: 12 }}>
           <input className="oe-input" value={form.inv_id} onChange={(e) => setForm((f) => ({ ...f, inv_id: e.target.value }))} placeholder="INV ID, e.g. OPGAE0034" style={{ maxWidth: 200 }} aria-label="New item INV ID" maxLength={40} />
           <input className="oe-input" value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} placeholder="Description" style={{ flex: 1, minWidth: 220 }} aria-label="New item description" maxLength={120} />
           <Button icon="plus" disabled={!form.inv_id.trim() || !form.description.trim()} onClick={addItem}>
             Add item
           </Button>
-        </div>
+        </Filters>
         <div className="oe-tablewrap">
           <table className="oe-table tight">
             <thead>
@@ -7891,7 +8179,7 @@ function DistrictRates() {
       <p className="muted" style={{ maxWidth: "76ch" }}>
         Leave a cell blank to use the expense type's default rate. A district rate overrides it for every project in that district, for both the calculation and the default allocation.
       </p>
-      <div className="oe-filters" style={{ marginBottom: 0 }}>
+      <Filters style={{ marginBottom: 0 }}>
         <label className="oe-check">
           <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> Show all expense types
         </label>
@@ -7912,7 +8200,7 @@ function DistrictRates() {
         <Button variant="primary" disabled={!changes.length} busy={busy} onClick={save}>
           Save {changes.length || ""} {changes.length === 1 ? "change" : "changes"}
         </Button>
-      </div>
+      </Filters>
       <div className="oe-tablewrap">
         <table className="oe-table tight oe-matrix">
           <thead>
@@ -7972,13 +8260,13 @@ function UsersAdmin() {
 
   return (
     <div className="oe-stack">
-      <div className="oe-filters" style={{ marginBottom: 0 }}>
+      <Filters style={{ marginBottom: 0 }}>
         <SearchBox value={q} onChange={setQ} placeholder="Search name or email" />
         <span style={{ flex: 1 }} />
         <Button variant="primary" icon="plus" onClick={() => setInviting(true)}>
           Invite user
         </Button>
-      </div>
+      </Filters>
       <div className="oe-tablewrap">
         <table className="oe-table">
           <thead>
@@ -8168,6 +8456,11 @@ function AccessRights() {
     run(() => api.deleteRole(r.role), `${r.label} removed`);
   };
   const groups = [...new Set(PERMISSIONS.map((p) => p.group))];
+  // phones: the grid shows one role at a time, chosen from a list (administrators are read-only, so start on the next role)
+  const phone = useIsPhone();
+  const [roleView, setRoleView] = useState("");
+  const defaultRole = (roles.find((r) => r.role !== "admin") || roles[0] || {}).role;
+  const shownRoles = phone ? roles.filter((r) => r.role === (roleView || defaultRole)) : roles;
 
   return (
     <div className="oe-stack">
@@ -8184,12 +8477,23 @@ function AccessRights() {
           </Button>
         </div>
       </div>
+      {phone && (
+        <Field label="Role" as="div">
+          <select className="oe-select" value={roleView || defaultRole || ""} onChange={(e) => setRoleView(e.target.value)} aria-label="Role to edit">
+            {roles.map((r) => (
+              <option key={r.role} value={r.role}>
+                {r.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
       <div className="oe-tablewrap">
         <table className="oe-table tight oe-matrix">
           <thead>
             <tr>
               <th>Permission</th>
-              {roles.map((r) => (
+              {shownRoles.map((r) => (
                 <th key={r.role} className="c">
                   {r.label}
                   {r.role !== "admin" && !["tm", "accounting", "liaison"].includes(r.role) && (
@@ -8206,12 +8510,12 @@ function AccessRights() {
             {groups.map((g) => (
               <React.Fragment key={g}>
                 <tr className="grp">
-                  <td colSpan={roles.length + 1}>{g}</td>
+                  <td colSpan={shownRoles.length + 1}>{g}</td>
                 </tr>
                 {PERMISSIONS.filter((p) => p.group === g).map((p) => (
                   <tr key={p.key}>
                     <td style={{ paddingLeft: 22 }}>{p.label}</td>
-                    {roles.map((r) => {
+                    {shownRoles.map((r) => {
                       // some permissions are limited to certain roles (e.g. fund returns); the database enforces the same
                       const barred = p.roles && !p.roles.includes(r.role);
                       // nobody but an administrator changes the rights of their own role (the database checks the same)
@@ -8590,7 +8894,7 @@ function Login({ api, onDone, onSwitchMode, notice }) {
             )}
           </div>
         ) : (
-          <div className="oe-login-card" onKeyDown={(e) => e.key === "Enter" && e.target.tagName === "INPUT" && submit(e)}>
+          <form className="oe-login-card" onSubmit={submit}>
             <div>
               <h2>Sign in</h2>
               <p className="muted" style={{ marginTop: 4 }}>
@@ -8626,7 +8930,7 @@ function Login({ api, onDone, onSwitchMode, notice }) {
             </Field>
             {captchaOn && <Captcha siteKey={CONFIG.captchaSiteKey} onToken={setCaptcha} resetKey={captchaReset} />}
             {msg && <Note tone={msg.tone}>{msg.text}</Note>}
-            <Button variant="primary" busy={busy} onClick={submit}>
+            <Button type="submit" variant="primary" busy={busy} onClick={submit}>
               Sign in
             </Button>
             {onSwitchMode && DEMO_ENABLED && (
@@ -8639,7 +8943,7 @@ function Login({ api, onDone, onSwitchMode, notice }) {
                 </Button>
               </>
             )}
-          </div>
+          </form>
         )}
     </SignInFrame>
   );
@@ -8687,7 +8991,7 @@ function SetPassword({ api, onDone }) {
   };
   return (
     <SignInFrame>
-        <div className="oe-login-card" onKeyDown={(e) => e.key === "Enter" && e.target.tagName === "INPUT" && submit(e)}>
+        <form className="oe-login-card" onSubmit={submit}>
           <div>
             <h2>Set your password</h2>
             <p className="muted" style={{ marginTop: 4 }}>
@@ -8721,10 +9025,10 @@ function SetPassword({ api, onDone }) {
             <input className="oe-input" type={show ? "text" : "password"} autoComplete="new-password" value={b} onChange={(e) => setB(e.target.value)} />
           </Field>
           {err && <Note tone="bad">{err}</Note>}
-          <Button variant="primary" busy={busy} onClick={submit}>
+          <Button type="submit" variant="primary" busy={busy} onClick={submit}>
             Confirm password
           </Button>
-        </div>
+        </form>
     </SignInFrame>
   );
 }
@@ -8732,15 +9036,204 @@ function SetPassword({ api, onDone }) {
 /* ---------------------------------------------------------------------
    17. APP SHELL
    --------------------------------------------------------------------- */
+// path: the module's address. vercel.json rewrites each one to the app so it can be opened or reloaded directly.
 const NAV = [
-  { id: "report", label: "Project report", icon: "report", perms: ["report.view"] },
-  { id: "new", label: "New request", icon: "plus", perms: ["requests.create"] },
-  { id: "approvals", label: "Approvals", icon: "check", perms: ["requests.approve"] },
-  { id: "requests", label: "Request list", icon: "list", perms: ["requests.view_own", "requests.view_all"] },
-  { id: "analysis", label: "Analysis", icon: "clock", perms: ["analysis.view"] },
-  { id: "projects", label: "Project listing", icon: "folder", perms: ["projects.view"] },
-  { id: "settings", label: "Settings", icon: "sliders", perms: ["settings.expenses", "settings.users"] },
+  { id: "report", path: "/project-report", label: "Project report", icon: "report", perms: ["report.view"] },
+  { id: "new", path: "/new-request", label: "New request", icon: "plus", perms: ["requests.create"] },
+  { id: "approvals", path: "/approvals", label: "Approvals", icon: "check", perms: ["requests.approve"] },
+  { id: "requests", path: "/requests", label: "Request list", icon: "list", perms: ["requests.view_own", "requests.view_all"] },
+  { id: "analysis", path: "/analysis", label: "Analysis", icon: "clock", perms: ["analysis.view"] },
+  { id: "projects", path: "/projects", label: "Project listing", icon: "folder", perms: ["projects.view"] },
+  { id: "settings", path: "/settings", label: "Settings", icon: "sliders", perms: ["settings.expenses", "settings.users"] },
 ];
+const NAV_COLLAPSED_KEY = "oe-nav-collapsed"; // localStorage: the side panel was collapsed to icons on this browser
+const IOS_HINT_KEY = "oe-ios-hint"; // localStorage: the "Add to Home Screen" hint was dismissed
+
+/* Installing as an app. Chrome on Android fires beforeinstallprompt, possibly before React mounts, so it is caught here
+   and offered later as an "Install app" button. iPhones have no prompt: Safari users add it from the Share menu. */
+const IS_IOS = typeof navigator !== "undefined" && (/iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+const STANDALONE = typeof window !== "undefined" && ((window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true);
+let installPrompt = null;
+if (typeof window !== "undefined")
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    installPrompt = e;
+    window.dispatchEvent(new Event("oe-install-ready"));
+  });
+
+/* Push notifications (Web Push). Offered when the build carries the public key, the browser supports push and the
+   app's service worker is installed (production builds; never the dev server or the demo). The browser sends the
+   subscription to Supabase; the oe-push function sends the notifications. On iPhone and iPad, push works only in the
+   app added to the Home Screen. */
+const PUSH_SUPPORTED = typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const PUSH_LATER_KEY = "oe-push-later"; // sessionStorage: "Not now" was tapped in this tab
+const b64urlToBytes = (str) => {
+  const b = atob(str.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(str.length / 4) * 4, "="));
+  const out = new Uint8Array(b.length);
+  for (let i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
+  return out;
+};
+const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+/** Subscribes this browser (or keeps its subscription current) and saves it for the signed-in person. */
+async function pushSubscribe(api) {
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (!reg) throw new Error("The app's service worker is not installed yet. Reload the page and try again.");
+  const key = b64urlToBytes(CONFIG.vapidPublicKey);
+  const subscribe = () => reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  let sub = await reg.pushManager.getSubscription();
+  // a subscription made with an older key pair cannot be used by the function: start over
+  if (sub && sub.options && sub.options.applicationServerKey && !sameBytes(new Uint8Array(sub.options.applicationServerKey), key)) {
+    await sub.unsubscribe();
+    sub = null;
+  }
+  if (!sub) sub = await subscribe();
+  const save = (x) => {
+    const j = x.toJSON();
+    return api.savePushSubscription({ endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, user_agent: navigator.userAgent.slice(0, 200) });
+  };
+  try {
+    await save(sub);
+  } catch (e) {
+    // this browser's subscription belongs to another account (someone else signed in here): make a fresh one
+    await sub.unsubscribe();
+    sub = await subscribe();
+    await save(sub);
+  }
+  return sub;
+}
+/** Sign-out: this device stops receiving this person's notifications. */
+async function pushForget(api) {
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    const sub = reg && (await reg.pushManager.getSubscription());
+    if (sub) await api.removePushSubscription(sub.endpoint);
+  } catch (e) {
+    /* best effort */
+  }
+}
+function usePush(api, ready, approver) {
+  const ui = useUI();
+  const offered = PUSH_SUPPORTED && !!CONFIG.vapidPublicKey && api.mode === "live";
+  const [perm, setPerm] = useState(() => (PUSH_SUPPORTED ? Notification.permission : "unsupported"));
+  const [later, setLater] = useState(() => {
+    try {
+      return sessionStorage.getItem(PUSH_LATER_KEY) === "1";
+    } catch (e) {
+      return false;
+    }
+  });
+  const [busy, setBusy] = useState(false);
+  // already allowed: keep the subscription current on every sign-in, silently
+  useEffect(() => {
+    if (offered && ready && perm === "granted") pushSubscribe(api).catch(() => {});
+  }, [offered, ready, perm, api]);
+  const enable = useCallback(async () => {
+    setBusy(true);
+    try {
+      const p = await Notification.requestPermission(); // must follow a tap or click
+      setPerm(p);
+      if (p !== "granted") {
+        if (p === "denied") ui.err("Notifications are blocked for this site. Allow them in the browser's site settings, then try again.");
+        return;
+      }
+      await pushSubscribe(api);
+      await api.pushTest();
+      ui.ok("Notifications are on. A test notification is on its way.");
+    } catch (e) {
+      ui.err((e && e.message) || "Notifications could not be turned on.");
+    } finally {
+      setBusy(false);
+    }
+  }, [api, ui]);
+  const notNow = useCallback(() => {
+    try {
+      sessionStorage.setItem(PUSH_LATER_KEY, "1");
+    } catch (e) {
+      /* asked again next time */
+    }
+    setLater(true);
+  }, []);
+  const iosNeedsInstall = IS_IOS && !STANDALONE && !PUSH_SUPPORTED && api.mode === "live" && !!CONFIG.vapidPublicKey;
+  const show = ready && !later && (offered ? perm === "default" || perm === "denied" : iosNeedsInstall);
+  return { show, perm, busy, enable, notNow, iosNeedsInstall, approver };
+}
+function PushCard({ push }) {
+  if (!push.show) return null;
+  let title, text, action = null;
+  if (push.iosNeedsInstall) {
+    title = push.approver ? "Get notified when a request needs your approval" : "Get notified when your requests are approved";
+    text = "On iPhone and iPad, notifications work in the installed app: tap Share, then Add to Home Screen, then turn them on there.";
+  } else if (push.perm === "denied") {
+    title = "Notifications are blocked for this site";
+    text = "Allow them in your browser's site settings (the icon left of the address), then reload this page.";
+  } else {
+    title = push.approver ? "Turn on notifications so you know when a request needs your approval" : "Turn on notifications to hear when your requests are approved or rejected";
+    text = `This device is told even when the app is closed, as long as it has internet.${push.approver ? " Approvers need this on." : ""}`;
+    action = (
+      <Button size="sm" variant="primary" busy={push.busy} onClick={push.enable}>
+        Turn on notifications
+      </Button>
+    );
+  }
+  return (
+    <div className="oe-push" role="region" aria-label="Notifications">
+      <Icon name="bell" size={18} />
+      <div>
+        <b>{title}</b>
+        <p>{text}</p>
+      </div>
+      <div className="oe-actions">
+        <Button size="sm" onClick={push.notNow}>
+          Not now
+        </Button>
+        {action}
+      </div>
+    </div>
+  );
+}
+
+/* "Needs my action" count on the favicon (browser tabs) and the app icon (installed app). */
+let faviconImage = null;
+function setFaviconBadge(n) {
+  const link = document.querySelector('link[rel="icon"]');
+  if (!link || /jsdom/i.test(navigator.userAgent)) return;
+  if (!n) {
+    link.href = "/favicon.svg";
+    link.type = "image/svg+xml";
+    return;
+  }
+  const draw = () => {
+    const c = document.createElement("canvas");
+    c.width = c.height = 64;
+    const g = c.getContext("2d");
+    if (!g) return;
+    g.drawImage(faviconImage, 0, 0, 64, 64);
+    const label = n > 99 ? "99+" : String(n);
+    g.font = "bold 26px Poppins, Arial, sans-serif";
+    const w = Math.max(30, g.measureText(label).width + 14);
+    g.fillStyle = "#d03a2a";
+    g.beginPath();
+    g.arc(64 - w + 15, 15, 15, Math.PI / 2, Math.PI * 1.5);
+    g.arc(64 - 15, 15, 15, -Math.PI / 2, Math.PI / 2);
+    g.closePath();
+    g.fill();
+    g.fillStyle = "#fff";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillText(label, 64 - w / 2, 16);
+    link.href = c.toDataURL("image/png");
+    link.type = "image/png";
+  };
+  if (faviconImage && faviconImage.complete) return draw();
+  faviconImage = new Image();
+  faviconImage.onload = draw;
+  faviconImage.src = "/favicon.svg";
+}
+const pageFromPath = (path) => {
+  const clean = (path || "").replace(/\/+$/, "").toLowerCase();
+  return (NAV.find((n) => n.path === clean) || {}).id || null;
+};
+const pathOfPage = (id) => (NAV.find((n) => n.id === id) || {}).path || null;
 
 function Root() {
   const ui = useUI();
@@ -8750,10 +9243,75 @@ function Root() {
   const [auth, setAuth] = useState({ status: "loading" });
   const [profile, setProfile] = useState(null);
   const [data, setData] = useState(null);
-  const [page, setPage] = useState(null);
+  // a module's address opened directly (e.g. a bookmark) is remembered while signing in, then opened
+  const [page, setPage] = useState(() => pageFromPath(INITIAL_PATH));
   const [params, setParams] = useState(null);
   const [navOpen, setNavOpen] = useState(false);
-  const [loginNotice, setLoginNotice] = useState(null); // shown on the sign-in page after an invite's password is set
+  const [navCollapsed, setNavCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(NAV_COLLAPSED_KEY) === "1";
+    } catch (e) {
+      return false;
+    }
+  });
+  const toggleNav = useCallback(() => {
+    setNavCollapsed((v) => {
+      try {
+        localStorage.setItem(NAV_COLLAPSED_KEY, v ? "0" : "1");
+      } catch (e) {
+        /* storage blocked: the choice lasts until reload */
+      }
+      return !v;
+    });
+  }, []);
+  // 768 to 960px (tablets): the side panel is always the icon strip; the collapse choice applies from 961px up
+  const tabletNarrow = useMediaQuery(TABLET_QUERY);
+  const desktop = useMediaQuery("(min-width:961px)");
+  const collapsed = navCollapsed || tabletNarrow;
+  const [canInstall, setCanInstall] = useState(() => !!installPrompt);
+  const [iosHint, setIosHint] = useState(() => {
+    try {
+      return IS_IOS && !STANDALONE && localStorage.getItem(IOS_HINT_KEY) !== "1";
+    } catch (e) {
+      return false;
+    }
+  });
+  useEffect(() => {
+    const ready = () => setCanInstall(true);
+    const done = () => {
+      installPrompt = null;
+      setCanInstall(false);
+    };
+    window.addEventListener("oe-install-ready", ready);
+    window.addEventListener("appinstalled", done);
+    return () => {
+      window.removeEventListener("oe-install-ready", ready);
+      window.removeEventListener("appinstalled", done);
+    };
+  }, []);
+  const install = useCallback(async () => {
+    const p = installPrompt;
+    if (!p) return;
+    p.prompt();
+    try {
+      await p.userChoice;
+    } catch (e) {
+      /* dismissed */
+    }
+    installPrompt = null;
+    setCanInstall(false);
+  }, []);
+  const dismissIosHint = useCallback(() => {
+    try {
+      localStorage.setItem(IOS_HINT_KEY, "1");
+    } catch (e) {
+      /* storage blocked: the hint comes back next time */
+    }
+    setIosHint(false);
+  }, []);
+  const [popTick, setPopTick] = useState(0); // bumped on browser back/forward so the address is re-checked
+  const addressMode = useRef("replace"); // "push" when the next address change is a module the person chose
+  const [loginNotice, setLoginNotice] = useState(takeSignInNotice); // shown on the sign-in page after an invite's password is set
   const switchMode = useCallback((m) => {
     if (m === "live" && !LIVE) return;
     if (m === "demo" && !DEMO_ENABLED) return;
@@ -8787,6 +9345,8 @@ function Root() {
 
   const signOut = useCallback(
     async (message) => {
+      if (api.mode === "live" && PUSH_SUPPORTED) await pushForget(api);
+      if (navigator.clearAppBadge) navigator.clearAppBadge().catch(() => {});
       try {
         await api.signOut();
       } finally {
@@ -8806,10 +9366,21 @@ function Root() {
   // The invited person has confirmed a password: end the invite session and ask them to sign in with it.
   const passwordSet = useCallback(
     async (email) => {
-      setLoginNotice({ tone: "info", user: email || "", text: "Your password is saved. Sign in with your email and the password you just set." });
+      const notice = { tone: "info", user: email || "", text: "Your password is saved. Sign in with your email and the password you just set." };
+      if (INVITE_TAB) {
+        // end the in-memory invite session, then reload as the normal sign-in page (the administrator's session, if any, is untouched)
+        try {
+          await api.signOut();
+        } catch (e) {
+          /* the session is memory-only; the reload discards it anyway */
+        }
+        handoffToSignIn(notice);
+        return;
+      }
+      setLoginNotice(notice);
       await signOut();
     },
-    [signOut]
+    [api, signOut]
   );
 
   useEffect(() => {
@@ -8820,10 +9391,14 @@ function Root() {
         if (!alive) return;
         if (LINK_ERROR && window.history && window.history.replaceState) window.history.replaceState(null, "", window.location.pathname + window.location.search);
         if (!user) {
+          let notice = null;
           if (LINK_ERROR)
-            setLoginNotice({ tone: "warn", text: /expired/i.test(LINK_ERROR) ? "That link was already used or has expired. Ask your administrator to send a new invite." : "That link could not be used. Ask your administrator to send a new invite." });
+            notice = { tone: "warn", text: /expired/i.test(LINK_ERROR) ? "That link was already used or has expired. Ask your administrator to send a new invite." : "That link could not be used. Ask your administrator to send a new invite." };
           else if (INITIAL_PATH === INVITE_PATH)
-            setLoginNotice({ tone: "info", text: "To set your password, open the link in your invitation email. Already set it? Sign in below." });
+            notice = { tone: "info", text: "To set your password, open the link in your invitation email. Already set it? Sign in below." };
+          // the invite tab never shows the sign-in form itself: its session would not survive a reload
+          if (INVITE_TAB) return handoffToSignIn(notice);
+          if (notice) setLoginNotice(notice);
           return setAuth({ status: "signed_out" });
         }
         if (NEEDS_PASSWORD) return setAuth({ status: "set_password" });
@@ -8902,6 +9477,7 @@ function Root() {
     return true;
   }, [ui]);
   const go = useCallback((p, prm = null) => {
+    addressMode.current = "push";
     setPage(p);
     setParams(prm);
     setNavOpen(false);
@@ -8923,22 +9499,48 @@ function Root() {
     return { approvals, requests };
   }, [data, me, can, idx]);
 
+  const push = usePush(api, auth.status === "ready", can("requests.approve"));
+  // "Needs my action" count on the tab title, the favicon and the installed app's icon
+  const actionCount = auth.status === "ready" ? badges.requests || 0 : 0;
+  useEffect(() => {
+    setFaviconBadge(actionCount);
+    if (navigator.setAppBadge) (actionCount ? navigator.setAppBadge(actionCount) : navigator.clearAppBadge()).catch(() => {});
+  }, [actionCount]);
+
   const ctx = useMemo(
     () => (data && me ? { api, data, idx, me, can, settings: data.settings, run, go, reload, ui, setLeaveGuard, confirmLeave } : null),
     [api, data, idx, me, can, run, go, reload, ui, setLeaveGuard, confirmLeave]
   );
 
-  // address bar: the set-password page lives at INVITE_PATH; every other screen is at the root
+  // address bar: /sign-in, /invite/set-password, or the open module's path (see NAV).
+  // Choosing a module adds a history entry; every other correction (after sign-in, sign-out, an unknown or
+  // unpermitted address) replaces the current one, so Back never returns to the sign-in page.
   useEffect(() => {
     if (!(window.history && window.history.replaceState) || auth.status === "loading") return;
-    const want = auth.status === "set_password" ? INVITE_PATH : "/";
-    const at = window.location.pathname;
-    if (at !== want && (want === INVITE_PATH || at === INVITE_PATH || at.startsWith("/invite/")))
-      window.history.replaceState(null, "", want + window.location.search);
-  }, [auth.status]);
+    const how = addressMode.current;
+    addressMode.current = "replace";
+    const want = auth.status === "set_password" ? INVITE_PATH : auth.status === "signed_out" ? SIGNIN_PATH : auth.status === "ready" ? pathOfPage(current) : null;
+    if (!want || window.location.pathname === want) return;
+    window.history[how === "push" ? "pushState" : "replaceState"](null, "", want + window.location.search);
+  }, [auth.status, current, popTick]);
+
+  // browser back/forward: open the module at the new address (asking first if there are unsaved changes)
+  useEffect(() => {
+    const onPop = async () => {
+      const target = pageFromPath(window.location.pathname);
+      if (auth.status === "ready" && target && target !== current && (await confirmLeave())) {
+        setPage(target);
+        setParams(null);
+        setNavOpen(false);
+      }
+      setPopTick((t) => t + 1); // declined, signed out, or an address with no module: the effect above corrects it
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [auth.status, current, confirmLeave]);
 
   // the browser tab stays neutral until someone is signed in
-  const tabTitle = auth.status === "ready" ? "Project Expense Monitoring" : auth.status === "set_password" ? "Set your password" : "Sign in";
+  const tabTitle = auth.status === "ready" ? `${actionCount ? `(${actionCount}) ` : ""}Project Expense Monitoring` : auth.status === "set_password" ? "Set your password" : "Sign in";
   useEffect(() => {
     document.title = tabTitle;
   }, [tabTitle]);
@@ -8953,8 +9555,8 @@ function Root() {
     return (
       <div className="oe-center">
         <div className="oe-stack" style={{ maxWidth: 440 }}>
-          <h2>Can't reach the server</h2>
-          <p className="muted">{auth.message}</p>
+          <h2>{typeof navigator !== "undefined" && navigator.onLine === false ? "You're offline" : "Can't reach the server"}</h2>
+          <p className="muted">{typeof navigator !== "undefined" && navigator.onLine === false ? "Connect to the internet, then try again. Nothing is stored on this device." : auth.message}</p>
           <Button variant="primary" onClick={() => window.location.reload()}>
             Try again
           </Button>
@@ -8992,17 +9594,26 @@ function Root() {
 
   return (
     <AppCtx.Provider value={ctx}>
-      <div className="oe-shell">
+      <div className={`oe-shell ${collapsed ? "collapsed" : ""}`}>
         {navOpen && <div className="oe-scrim" onClick={() => setNavOpen(false)} />}
         <aside className={`oe-side ${navOpen ? "open" : ""}`}>
+          <button className="oe-side-x" onClick={() => setNavOpen(false)} aria-label="Close menu">
+            <Icon name="x" />
+          </button>
           <div className="oe-brand">
-            <b>Project Expense Monitoring</b>
+            <b className="full">Project Expense Monitoring</b>
+            <b className="short" aria-hidden="true">PEM</b>
           </div>
           <nav className="oe-nav" aria-label="Main">
             {visible.map((n) => (
-              <button key={n.id} aria-current={current === n.id ? "page" : undefined} onClick={async () => (n.id === current && !params ? setNavOpen(false) : (await confirmLeave()) && go(n.id))}>
+              <button
+                key={n.id}
+                aria-current={current === n.id ? "page" : undefined}
+                title={collapsed ? (badges[n.id] > 0 ? `${n.label} (${badges[n.id]})` : n.label) : undefined}
+                onClick={async () => (n.id === current && !params ? setNavOpen(false) : (await confirmLeave()) && go(n.id))}
+              >
                 <Icon name={n.icon} />
-                {n.label}
+                <span className="lbl">{n.label}</span>
                 {badges[n.id] > 0 && <span className="badge">{badges[n.id]}</span>}
               </button>
             ))}
@@ -9010,13 +9621,33 @@ function Root() {
           <div className="oe-me">
             <b>{me.full_name || me.email}</b>
             <small>{roleRow ? roleRow.label : me.role}</small>
-            <button onClick={async () => (await confirmLeave()) && signOut()}>
-              <Icon name="logout" size={14} /> Sign out
-            </button>
-            <div className="oe-conf">
-              <Icon name="lock" size={13} /> Confidential. Authorized users only.
+            <div className="oe-me-row">
+              <button onClick={async () => (await confirmLeave()) && signOut()} title={collapsed ? "Sign out" : undefined} aria-label="Sign out">
+                <Icon name="logout" size={14} /> <span className="lbl">Sign out</span>
+              </button>
+              {/* phones and tablets only: desktop browsers already offer install in the address bar */}
+              {canInstall && !desktop && (
+                <button onClick={install} title={collapsed ? "Install app" : undefined} aria-label="Install app">
+                  <Icon name="download" size={14} /> <span className="lbl">Install app</span>
+                </button>
+              )}
+            </div>
+            {iosHint && (
+              <div className="oe-install">
+                <p>To add this to your Home Screen: tap Share, then Add to Home Screen.</p>
+                <button onClick={dismissIosHint}>Got it</button>
+              </div>
+            )}
+            <div className="oe-conf" title={collapsed ? "Confidential. Authorized users only." : undefined}>
+              <Icon name="lock" size={13} /> <span className="lbl">Confidential. Authorized users only.</span>
             </div>
           </div>
+          {!tabletNarrow && (
+            <button className="oe-side-toggle" onClick={toggleNav} aria-expanded={!navCollapsed} aria-label={navCollapsed ? "Expand side panel" : "Collapse side panel"} title={navCollapsed ? "Expand" : undefined}>
+              <Icon name={navCollapsed ? "expand" : "collapse"} size={16} />
+              <span className="lbl">Collapse</span>
+            </button>
+          )}
         </aside>
         <main className="oe-main">
           <div className="oe-topbar">
@@ -9026,10 +9657,30 @@ function Root() {
             <b style={{ fontWeight: 500 }}>{currentLabel}</b>
           </div>
           {api.mode === "demo" && <div className="oe-demo">Demo mode with sample data. Changes reset when you reload. Signed in as {me.full_name}.</div>}
+          <PushCard push={push} />
           <PageComp key={current + JSON.stringify(params || {})} params={params} />
         </main>
       </div>
     </AppCtx.Provider>
+  );
+}
+
+/** Installed-app updates: main.jsx raises oe-sw-update when a new build is waiting; reloading applies it. */
+function UpdateBanner() {
+  const [apply, setApply] = useState(() => (typeof window !== "undefined" && window.__oeSwUpdate) || null);
+  useEffect(() => {
+    const on = (e) => setApply(() => e.detail);
+    window.addEventListener("oe-sw-update", on);
+    return () => window.removeEventListener("oe-sw-update", on);
+  }, []);
+  if (!apply) return null;
+  return (
+    <div className="oe-update" role="status">
+      A new version is ready.
+      <button type="button" onClick={() => apply()}>
+        Reload
+      </button>
+    </div>
   );
 }
 
@@ -9039,6 +9690,7 @@ export default function App() {
       <style>{CSS}</style>
       <UIProvider>
         <Root />
+        <UpdateBanner />
       </UIProvider>
     </div>
   );

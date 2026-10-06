@@ -420,3 +420,7 @@ enabled = true
 # The function checks the caller itself (auth.getUser + oe_has_perm), which also works with the newer
 # publishable API keys that the gateway JWT check does not understand.
 verify_jwt = false
+
+[functions.oe-push]
+# Same: the function checks the caller's token itself before sending any notification.
+verify_jwt = false
