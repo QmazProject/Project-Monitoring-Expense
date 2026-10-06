@@ -100,18 +100,23 @@ Deno.serve(async (req) => {
   if (sErr) return json({ error: sErr.message }, 500);
   let sent = 0, failed = 0;
   const gone: string[] = [];
+  // one line per device for the caller's console: the push service's answer, never the device's address or keys
+  const details: { service: string; status: number | string; note?: string }[] = [];
   await Promise.all(
     (subs || []).map(async (s: { id: string; endpoint: string; p256dh: string; auth: string }) => {
+      const service = new URL(s.endpoint).host;
       try {
         const res = await sendPush(s, payload, vapid, { ttl: 24 * 3600, urgency: "high" });
         if (res.ok) sent++;
         else if (res.status === 404 || res.status === 410) gone.push(s.id);
         else failed++;
-      } catch {
+        details.push({ service, status: res.status, note: res.ok ? undefined : (await res.text()).slice(0, 160) });
+      } catch (e) {
         failed++;
+        details.push({ service, status: "error", note: String(e && (e as Error).message).slice(0, 160) });
       }
     })
   );
   if (gone.length) await admin.from("oe_push_subscriptions").delete().in("id", gone);
-  return json({ sent, failed, removed: gone.length });
+  return json({ event, recipients: recipients.length, sent, failed, removed: gone.length, details });
 });

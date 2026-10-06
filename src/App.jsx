@@ -1761,6 +1761,7 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-search{position:relative;flex:1 1 240px;max-width:360px}.oe-search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--faint)}
 .oe-search .oe-input{padding-left:33px;width:100%}
 .oe-tablewrap{overflow:auto;border:1px solid var(--line);border-radius:var(--r);background:var(--surface);max-width:100%}
+.oe-scrollx{overflow-x:auto}
 .oe-table{width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px}
 .oe-table th{position:sticky;top:0;background:var(--sunk);color:var(--muted);font-weight:500;font-size:12.5px;text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap;z-index:1}
 .oe-table td{padding:11px 12px;border-bottom:1px solid var(--row);vertical-align:top}
