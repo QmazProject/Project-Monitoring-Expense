@@ -9374,7 +9374,10 @@ function Root() {
 
   const signOut = useCallback(
     async (message) => {
-      if (api.mode === "live" && PUSH_SUPPORTED) await pushForget(api);
+      // Signing out on purpose stops this device's notifications (a shared computer must not keep showing them).
+      // The idle timeout passes a message and keeps them: working in another tab or browser for 30 minutes must
+      // not switch notifications off; the notification then opens the sign-in page and, after it, the right page.
+      if (typeof message !== "string" && api.mode === "live" && PUSH_SUPPORTED) await pushForget(api);
       if (navigator.clearAppBadge) navigator.clearAppBadge().catch(() => {});
       try {
         await api.signOut();

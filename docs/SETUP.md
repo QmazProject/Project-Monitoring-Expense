@@ -85,6 +85,15 @@ What people see: after signing in, a bar offers **Turn on notifications** (appro
 - **What is sent:** the reference number, who filed it and the amount; nothing more. The notification opens Approvals or the Request list.
 - **Camera:** attaching a document from the phone camera works through the file picker; no camera permission is asked for.
 
+### What to expect on a desktop
+
+A notification goes to every browser a person turned notifications on in, not to the person in general, so these cases differ:
+
+- **Another tab open, or the app tab idle:** works. The notification comes from the browser's service worker, not from the open page. The 30-minute idle sign-out keeps the device registered; the notification then opens the sign-in page and, after signing in, the right page. Only an explicit **Sign out** removes the device (so a shared computer stops showing them).
+- **Another browser** (Chrome, Edge, Firefox, Safari are separate): each one must sign in once and press **Turn on notifications**. Check what is registered with `supabase db query --linked "select p.role, s.user_agent, s.last_seen_at from oe_push_subscriptions s join oe_profiles p on p.id = s.user_id"`.
+- **No browser window open:** works only while the browser is still running in the background. On Windows, Chrome and Edge do this by default (Settings → System → *Continue running background apps when the browser is closed*); on macOS the browser must be running, even with no window. If it isn't, the push service holds the message for 24 hours and delivers it when the browser next starts. Safari on macOS 13 or later delivers through the Notification Center even when closed.
+- **Nothing appears although it is allowed:** Windows Settings → System → Notifications (the browser must be on, and Focus assist off), macOS System Settings → Notifications → the browser, and the browser's own site settings for the app's address.
+
 Without `VITE_VAPID_PUBLIC_KEY` the bar is never shown and the app works as before.
 
 ## Sign-in page
