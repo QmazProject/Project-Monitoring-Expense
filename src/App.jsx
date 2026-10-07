@@ -7,6 +7,8 @@
    ===================================================================== */
 import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef, createContext, useContext } from "react";
 import { createClient } from "@supabase/supabase-js";
+// names this browser in oe_push_subscriptions, so one PC keeps one row however often its push address changes
+import { deviceId, endpointTail, pushSaveSteps } from "./push-device.js";
 
 /* ---------------------------------------------------------------------
    1. CONFIG
@@ -1667,24 +1669,32 @@ function createSupabaseApi() {
       await ok(c.rpc("oe_reject_request", { p_id: id, p_remarks: remarks }));
       notify("rejected", id);
     },
+    // One row per device, found again by its device id, so an office PC, a laptop, an Android phone and an
+    // iPhone each keep their own subscription and all of them are notified.
     async savePushSubscription(sub) {
       const c = await sb();
-      await ok(
-        c.from("oe_push_subscriptions").upsert(
-          { user_id: userId, endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth, user_agent: sub.user_agent || null, last_seen_at: new Date().toISOString() },
-          { onConflict: "endpoint" }
-        )
-      );
+      const row = { user_id: userId, device_id: sub.device_id || null, endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth, user_agent: sub.user_agent || null, last_seen_at: new Date().toISOString() };
+      // pushSaveSteps (src/push-device.js) decides the writes; row-level security limits every one of them to
+      // the signed-in person's own rows, so no other person's or device's subscription can be touched here.
+      for (const step of pushSaveSteps(row)) {
+        if (step.op === "delete") {
+          await c.from("oe_push_subscriptions").delete().eq("user_id", step.user_id).eq("endpoint", step.endpoint).or(`device_id.is.null,device_id.neq.${step.exceptDevice}`);
+          continue;
+        }
+        await ok(c.from("oe_push_subscriptions").upsert(step.row, { onConflict: step.onConflict }));
+      }
     },
     async removePushSubscription(endpoint) {
       const c = await sb();
       await c.from("oe_push_subscriptions").delete().eq("endpoint", endpoint);
     },
-    // unlike notify(), this one reports what went wrong, so the person is not told "on" when it isn't
-    async pushTest() {
+    // unlike notify(), this one reports what went wrong, so the person is not told "on" when it isn't.
+    // The address of the device that asked is sent along, so the answer is about that device and not about
+    // whichever of this person's devices happened to accept the message.
+    async pushTest(endpoint) {
       const c = await sb();
       // 25 s: longer than the function's own 15 s limit per push service, so a slow service is reported, not waited on
-      const { data, error } = await c.functions.invoke("oe-push", { body: { event: "test" }, timeout: 25_000 });
+      const { data, error } = await c.functions.invoke("oe-push", { body: { event: "test", endpoint: endpoint || null }, timeout: 25_000 });
       if (error) {
         let msg = error.message;
         if (error.name === "FunctionsFetchError") msg = "no answer from the server";
@@ -1692,7 +1702,7 @@ function createSupabaseApi() {
         throw new Error(msg);
       }
       if (data && data.error) throw new Error(data.error);
-      return data; // { sent, failed, removed }
+      return data; // { scope, devices, sent, failed, removed, pruned, device: { status, service, note, ... }, details }
     },
     async setErpRef(id, ref) { const c = await sb(); await ok(c.rpc("oe_set_erp_ref", { p_id: id, p_erp_ref: ref })); },
     async disburseRequest(id, date, remarks) { const c = await sb(); await ok(c.rpc("oe_disburse_request", { p_id: id, p_date: date, p_remarks: remarks || null })); },
@@ -9644,22 +9654,39 @@ async function pushSubscribe(api) {
       20000,
       'The browser\'s push service did not answer. Check that the browser allows push messaging (Brave: turn on "Use Google services for push messaging") and that the network is not blocking it, then try again.'
     );
+  const device = deviceId(); // this browser, whatever address the push service gives it today
+  // The row for an address this browser has just given up is deleted, so a re-subscription leaves no second row
+  // behind. Scoped by row-level security to the signed-in person, and an address belongs to one browser only, so
+  // this can never reach another device.
+  const drop = async (endpoint) => {
+    try {
+      await api.removePushSubscription(endpoint);
+    } catch (e) {
+      /* housekeeping: the stale row is forgotten later by the push service's 404/410 or the 90-day cleanup */
+    }
+  };
   let sub = await reg.pushManager.getSubscription();
   // a subscription made with an older key pair cannot be used by the function: start over
   if (sub && sub.options && sub.options.applicationServerKey && !sameBytes(new Uint8Array(sub.options.applicationServerKey), key)) {
+    const old = sub.endpoint;
     await sub.unsubscribe();
+    await drop(old);
     sub = null;
   }
   if (!sub) sub = await subscribe();
   const save = (x) => {
     const j = x.toJSON();
-    return api.savePushSubscription({ endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, user_agent: navigator.userAgent.slice(0, 200) });
+    return api.savePushSubscription({ device_id: device, endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, user_agent: navigator.userAgent.slice(0, 200) });
   };
   try {
     await save(sub);
   } catch (e) {
-    // this browser's subscription belongs to another account (someone else signed in here): make a fresh one
+    // the save was refused, normally because this browser's subscription belongs to another account (someone
+    // else signed in here): make a fresh one. Dropping the address we are giving up removes our own row for it
+    // if we have one; another account's row is left where it is, because row-level security stops there.
+    const old = sub.endpoint;
     await sub.unsubscribe();
+    await drop(old);
     sub = await subscribe();
     await save(sub);
   }
@@ -9693,34 +9720,61 @@ function usePush(api, ready, approver) {
   useEffect(() => {
     if (offered && ready && perm === "granted") pushSubscribe(api).catch(() => {});
   }, [offered, ready, perm, api]);
-  // saves this device's subscription, then asks the server for a test notification and reports what happened
+  // Saves this device's subscription, then asks the server to send a test notification to this device alone and
+  // reports what that device's own push service answered. A person may be signed in on several devices; the
+  // answer must be about the one in front of them, or another device's success hides this one's failure.
   const sendTest = useCallback(
     async (okText) => {
-      await pushSubscribe(api); // from here on this device is signed up
+      const sub = await pushSubscribe(api); // from here on this device is signed up
       let r;
       try {
-        r = await api.pushTest();
+        r = await api.pushTest(sub.endpoint);
       } catch (e) {
         return ui.err(`This device is signed up, but the test message could not be sent (${(e && e.message) || "unknown error"}). It will still get notifications.`);
       }
-      console.info("oe-push test", r); // per device: the push service and its answer (F12 → Console)
-      if (r && r.sent === 0) {
-        const note = ((r.details || []).find((d) => d.note) || {}).note;
-        ui.err(
-          r.failed
-            ? `This device is signed up, but the push service refused the test message${note ? ` (${note})` : ""}. Try again in a minute.`
-            : "This device could not be found for the test message. Turn notifications off and on again."
-        );
-      } else {
-        // On a PC the browser shows it through Windows, which can be the part that is off
-        const services = [...new Set(((r && r.details) || []).map((d) => d.service))].filter(Boolean);
-        const pc = /Windows|Macintosh|Linux/.test(navigator.userAgent) && !/Android|Mobile/.test(navigator.userAgent);
-        ui.ok(
-          `${okText} The push service${services.length ? ` (${services.join(", ")})` : ""} accepted it.${
-            pc ? " If nothing shows on this computer, check Windows Settings → System → Notifications for this browser, and that Focus assist / Do not disturb is off." : ""
-          }`
-        );
+      const d = (r && r.device) || null;
+      const perDevice = !!(r && r.scope === "device"); // an older oe-push build still answers for every device
+      // F12 → Console: which device asked, and what its push service said
+      console.info("oe-push test", {
+        event: (r && r.event) || "test",
+        scope: (r && r.scope) || "all-devices",
+        device_id: (d && d.device_id) || deviceId() || "(storage blocked)",
+        endpoint: endpointTail(sub.endpoint),
+        service: (d && d.service) || [...new Set(((r && r.details) || []).map((x) => x.service))].filter(Boolean).join(", "),
+        status: d ? d.status : "",
+        result: d ? d.text : "",
+        sent: r && r.sent,
+        failed: r && r.failed,
+        removed: r && r.removed,
+        pruned: r && r.pruned,
+        devices: r && r.devices, // how many devices this person has registered in all
+        note: (d && d.note) || "",
+      });
+      const reached = perDevice ? r.sent === 1 : !!(r && r.sent > 0);
+      if (!reached) {
+        if (!perDevice) {
+          const note = (((r && r.details) || []).find((x) => x.note) || {}).note;
+          return ui.err(
+            r && r.failed
+              ? `This device is signed up, but the push service refused the test message${note ? ` (${note})` : ""}. Try again in a minute.`
+              : "This device could not be found for the test message. Turn notifications off and on again."
+          );
+        }
+        if (r.removed) return ui.err(`This device's subscription had expired (${d ? d.text : "this device: gone"}), so it has been removed. Turn notifications off and on again.`);
+        if (r.failed)
+          return ui.err(
+            `This device is signed up, but ${d && d.service ? d.service : "the push service"} refused the test message (${d ? d.text : "no answer"}${d && d.note ? ` — ${d.note}` : ""}). Try again in a minute.`
+          );
+        return ui.err("This device is not registered for notifications. Turn notifications off and on again.");
       }
+      // On a PC the browser shows it through Windows, which can be the part that is off
+      const pc = /Windows|Macintosh|Linux/.test(navigator.userAgent) && !/Android|Mobile/.test(navigator.userAgent);
+      const accepted = d && d.service ? `${d.service} accepted it (${d.text}).` : "The push service accepted it.";
+      ui.ok(
+        `${okText} ${accepted}${
+          pc ? " If nothing shows on this computer, check Windows Settings → System → Notifications for this browser, and that Focus assist / Do not disturb is off." : ""
+        }`
+      );
     },
     [api, ui]
   );
