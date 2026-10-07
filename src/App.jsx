@@ -1416,9 +1416,12 @@ function createSupabaseApi() {
   const notify = async (event, requestId) => {
     try {
       const c = await sb();
-      await c.functions.invoke("oe-push", { body: { event, request_id: requestId || null } });
+      const { data, error } = await c.functions.invoke("oe-push", { body: { event, request_id: requestId || null }, timeout: 30_000 });
+      // visible in the browser console (F12) when checking who was reached: recipients, sent, failed, removed
+      if (error) console.warn("oe-push", event, error.message);
+      else console.info("oe-push", event, data);
     } catch (e) {
-      /* best effort */
+      console.warn("oe-push", event, e && e.message);
     }
   };
 
@@ -9626,7 +9629,11 @@ const askPermission = (onWaiting) =>
   });
 /** Subscribes this browser (or keeps its subscription current) and saves it for the signed-in person. */
 async function pushSubscribe(api) {
-  // the worker registers while the page loads: give a fresh tab a moment
+  // No registration at all means the page has no service worker: the dev server (npm run dev) never installs one,
+  // so notifications can't work there. Otherwise the worker registers while the page loads: give it a moment.
+  if (!(await navigator.serviceWorker.getRegistration())) {
+    throw new Error("This page has no service worker, so notifications can't work here. On a PC, build the app (npm run build) and open it with npm run preview, or use the live address.");
+  }
   const reg = await withTimeout(navigator.serviceWorker.ready, 8000, "The app's service worker is not installed yet. Reload the page and try again.");
   const key = b64urlToBytes(CONFIG.vapidPublicKey);
   // Chrome, Edge and Brave hand the request to their push service; when that is blocked (company network, Brave's
@@ -9696,9 +9703,24 @@ function usePush(api, ready, approver) {
       } catch (e) {
         return ui.err(`This device is signed up, but the test message could not be sent (${(e && e.message) || "unknown error"}). It will still get notifications.`);
       }
-      if (r && r.sent === 0)
-        ui.err(r.failed ? "This device is signed up, but the push service refused the test message. Try again in a minute." : "This device could not be found for the test message. Turn notifications off and on again.");
-      else ui.ok(okText);
+      console.info("oe-push test", r); // per device: the push service and its answer (F12 → Console)
+      if (r && r.sent === 0) {
+        const note = ((r.details || []).find((d) => d.note) || {}).note;
+        ui.err(
+          r.failed
+            ? `This device is signed up, but the push service refused the test message${note ? ` (${note})` : ""}. Try again in a minute.`
+            : "This device could not be found for the test message. Turn notifications off and on again."
+        );
+      } else {
+        // On a PC the browser shows it through Windows, which can be the part that is off
+        const services = [...new Set(((r && r.details) || []).map((d) => d.service))].filter(Boolean);
+        const pc = /Windows|Macintosh|Linux/.test(navigator.userAgent) && !/Android|Mobile/.test(navigator.userAgent);
+        ui.ok(
+          `${okText} The push service${services.length ? ` (${services.join(", ")})` : ""} accepted it.${
+            pc ? " If nothing shows on this computer, check Windows Settings → System → Notifications for this browser, and that Focus assist / Do not disturb is off." : ""
+          }`
+        );
+      }
     },
     [api, ui]
   );
@@ -9739,7 +9761,19 @@ function usePush(api, ready, approver) {
   }, []);
   const iosNeedsInstall = IS_IOS && !STANDALONE && !PUSH_SUPPORTED && api.mode === "live" && !!CONFIG.vapidPublicKey;
   const show = ready && !later && (offered ? perm === "default" || perm === "denied" : iosNeedsInstall);
-  return { show, perm, busy, quiet, enable, notNow, iosNeedsInstall, approver };
+  // "Test notifications" in the side panel: checks this device end to end (asks first if it was never allowed)
+  const test = useCallback(async () => {
+    if (Notification.permission !== "granted") return enable();
+    setBusy(true);
+    try {
+      await sendTest("A test notification is on its way to this device.");
+    } catch (e) {
+      ui.err((e && e.message) || "The test notification could not be sent.");
+    } finally {
+      setBusy(false);
+    }
+  }, [enable, sendTest, ui]);
+  return { show, perm, busy, quiet, offered, enable, test, notNow, iosNeedsInstall, approver };
 }
 /** Demo only: shows a sample notification on this device (there is no server in the demo to send a real one). */
 async function demoNotification(ui) {
@@ -10219,6 +10253,11 @@ function Root() {
               {api.mode === "demo" && typeof window !== "undefined" && "Notification" in window && (
                 <button onClick={() => demoNotification(ui).catch((e) => ui.err((e && e.message) || "The sample notification could not be shown."))} title={collapsed ? "Test notifications" : undefined} aria-label="Test notifications">
                   <Icon name="bell" size={14} /> <span className="lbl">Test notifications</span>
+                </button>
+              )}
+              {push.offered && (
+                <button onClick={push.test} disabled={push.busy} title={collapsed ? "Test notifications" : undefined} aria-label="Test notifications">
+                  <Icon name="bell" size={14} /> <span className="lbl">{push.busy ? "Testing…" : "Test notifications"}</span>
                 </button>
               )}
               {/* phones and tablets only: desktop browsers already offer install in the address bar */}
