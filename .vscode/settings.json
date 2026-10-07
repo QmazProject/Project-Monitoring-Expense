@@ -1,0 +1,7 @@
+{
+  // Lets VS Code download Vercel's description of vercel.json (the "$schema" line there),
+  // for autocomplete and typo checks while editing routes and headers. Editor only: no effect on the app or deploys.
+  "json.schemaDownload.trustedDomains": {
+    "https://openapi.vercel.sh/": true
+  }
+}

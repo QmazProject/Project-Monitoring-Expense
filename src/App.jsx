@@ -412,6 +412,18 @@ const linePaid = (l) => (l.paid_amount != null ? Number(l.paid_amount) : ["paid"
 /** Still in the liaison's hands (to give to the client, or to return). */
 const lineWithLiaison = (l) => (["disbursed", "part_paid"].includes(l.status) ? round2(lineNet(l) - linePaid(l)) : 0);
 
+/** A request as it stood before an edit, kept on the "edited" history entry so approvers can see what changed
+ *  (the database's oe_request_snapshot() builds the same shape). */
+const requestSnapshot = (r) => ({
+  request_date: r.request_date, date_needed: r.date_needed, remarks: r.remarks,
+  approved_by_name: r.approved_by_name, approved_at: r.approved_at, approval_remarks: r.approval_remarks, erp_ref: r.erp_ref,
+  lines: r.lines.map((l) => ({
+    id: l.id, line_no: l.line_no, project_id: l.project_id, type_id: l.type_id, description: l.description, payee: l.payee, detail: l.detail,
+    basis_amount: l.basis_amount, basis_pct: l.basis_pct, rate: l.rate, amount: l.amount, approved_amount: l.approved_amount,
+    documents: (l.documents || []).map((d) => ({ id: d.id, file_name: d.file_name })),
+  })),
+});
+
 /** Amount of a line still on the project it was filed under (after any reclassification). */
 const reclassRemaining = (l) => round2(lineNet(l) - (l.reclass || []).reduce((a, x) => a + Number(x.amount), 0));
 
@@ -853,6 +865,21 @@ function buildDemoDB() {
     { t: "t-oth", a: 1000000, d: "Fund released ahead of project assignment", payee: "Client representative", detail: "Advance fund", paid: true, acct: true, tm: true, paidAfter: 6 },
   ], { erp: "CF-000880", remarks: "Projects to be identified", apv: 3, erpd: 2, disb: 5 });
 
+  // REQ-0007 was approved, then the liaison raised material testing and added the allowance line: back for reapproval
+  {
+    const r7 = requests.find((x) => x.id === "r7");
+    const was = requestSnapshot(r7);
+    const approvedAt = daysAgoISO(1) + "T11:00:00";
+    Object.assign(was, { remarks: "Material testing, batch 2; CARI renewal", approved_by_name: name("u-tm"), approved_at: approvedAt });
+    was.lines = was.lines.slice(0, 2).map((l) => ({ ...l, approved_amount: l.amount }));
+    Object.assign(was.lines[0], { amount: 25000, approved_amount: 25000 });
+    events.push({ id: ++ev, request_id: "r7", line_id: null, action: "approved", note: null, actor_id: "u-tm", actor_name: name("u-tm"), created_at: approvedAt });
+    events.push({
+      id: ++ev, request_id: "r7", line_id: null, action: "edited", note: "2 → 3 lines; total 61,000.00 → 78,000.00; back to approval",
+      changes: { reapproval: true, before: was }, actor_id: "u-l1", actor_name: name("u-l1"), created_at: daysAgoISO(1) + "T15:20:00",
+    });
+  }
+
   return {
     categories: cats, types, acumaticaItems, districtRates, roles, profiles, projects, allocations, requests, events,
     settings: { ...DEFAULT_SETTINGS }, counters: { [`REQ-${year}`]: 9 },
@@ -879,8 +906,8 @@ function createDemoApi() {
   };
   const myName = () => (profile() || {}).full_name || "Unknown user";
   let evSeq = db.events.length + 100;
-  const log = (request_id, line_id, action, note) =>
-    db.events.push({ id: ++evSeq, request_id, line_id, action, note: note ? String(note).trim() || null : null, actor_id: me.id, actor_name: myName(), created_at: new Date().toISOString() });
+  const log = (request_id, line_id, action, note, changes = null) =>
+    db.events.push({ id: ++evSeq, request_id, line_id, action, note: note ? String(note).trim() || null : null, changes, actor_id: me.id, actor_name: myName(), created_at: new Date().toISOString() });
   const getReq = (id) => {
     const r = db.requests.find((x) => x.id === id);
     if (!r) throw new Error("Request not found.");
@@ -1045,6 +1072,7 @@ function createDemoApi() {
       if (!["on_hold", "open"].includes(r.status)) throw new Error(`${r.ref_no} has already been disbursed or closed, so it can't be edited.`);
       const wasApproved = r.status === "open";
       const oldErp = r.erp_ref;
+      const before = requestSnapshot(r);
       if (r.liaison_id !== me.id && profile().role !== "admin") throw new Error("You can only edit your own requests.");
       if (!req.date_needed) throw new Error("Enter the date needed.");
       if (req.date_needed < (req.request_date || r.request_date)) throw new Error("The date needed can't be before the request date.");
@@ -1083,7 +1111,7 @@ function createDemoApi() {
       }
       const fmt = (n) => Number(n).toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const newTotal = next.reduce((a, l) => a + Number(l.amount), 0);
-      log(r.id, null, "edited", `${oldN !== next.length ? `${oldN} → ${next.length} lines; ` : ""}total ${fmt(oldTotal)} → ${fmt(newTotal)}${wasApproved ? `; back to approval${oldErp ? `, ERP reference ${oldErp} cleared` : ""}` : ""}`);
+      log(r.id, null, "edited", `${oldN !== next.length ? `${oldN} → ${next.length} lines; ` : ""}total ${fmt(oldTotal)} → ${fmt(newTotal)}${wasApproved ? `; back to approval${oldErp ? `, ERP reference ${oldErp} cleared` : ""}` : ""}`, { reapproval: wasApproved, before });
       return r.ref_no;
     }),
     withdrawRequest: (id, remarks) => mutate(() => {
@@ -1652,10 +1680,12 @@ function createSupabaseApi() {
     // unlike notify(), this one reports what went wrong, so the person is not told "on" when it isn't
     async pushTest() {
       const c = await sb();
-      const { data, error } = await c.functions.invoke("oe-push", { body: { event: "test" } });
+      // 25 s: longer than the function's own 15 s limit per push service, so a slow service is reported, not waited on
+      const { data, error } = await c.functions.invoke("oe-push", { body: { event: "test" }, timeout: 25_000 });
       if (error) {
         let msg = error.message;
-        try { msg = (await error.context.json()).error || msg; } catch (e) { /* keep generic */ }
+        if (error.name === "FunctionsFetchError") msg = "no answer from the server";
+        else try { msg = (await error.context.json()).error || msg; } catch (e) { /* keep generic */ }
         throw new Error(msg);
       }
       if (data && data.error) throw new Error(data.error);
@@ -1725,7 +1755,6 @@ function createSupabaseApi() {
    Palette from huemint gradient-3: #002c46 → #0b4338 → #277876
    --------------------------------------------------------------------- */
 const CSS = `
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
 .oe{--navy:#002c46;--forest:#0b4338;--teal:#277876;--teal-d:#1d5f5d;--teal-50:#e4f0ee;--teal-100:#cde3e0;
 --bg:#eef3f2;--surface:#fff;--sunk:#f5f8f8;--line:#d7e1df;--line-2:#bccbc8;--ink:#002c46;--body:#27414d;--muted:#5d7480;--faint:#8b9ea6;
 --amber:#935d00;--amber-bg:#fcf0d6;--red:#b42318;--red-bg:#fdebe9;--blue:#1d4f7a;--blue-bg:#e3ecf5;--violet:#5b3d8f;--violet-bg:#eee8f7;--leaf:#4a6a12;--leaf-bg:#edf5dd;--green:#15603b;--green-bg:#e0f0e7;--slate:#3d5360;--slate-bg:#e6edef;
@@ -1878,8 +1907,12 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-fold .oe-filters .oe-select,.oe-fold .oe-filters .oe-input,.oe-fold .oe-search{width:100%;max-width:none}
 .oe-fold .oe-filters .oe-check{justify-content:space-between}
 .oe-kpi-more{justify-content:center;align-items:center;color:var(--teal-d);font-weight:500;font-size:13.5px}.oe-kpi-more::before{display:none}
-.oe-update{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:95;background:var(--navy);color:#fff;padding:10px 12px 10px 16px;border-radius:10px;display:flex;gap:12px;align-items:center;font-size:13.5px;box-shadow:0 12px 32px rgba(0,30,45,.28);max-width:calc(100vw - 32px)}
-.oe-update button{background:#fff;color:var(--navy);border:0;border-radius:7px;padding:8px 12px;font:inherit;font-weight:600;cursor:pointer}
+.oe-update{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:95;background:var(--navy);color:#fff;padding:10px 10px 10px 14px;border-radius:12px;display:flex;gap:10px;align-items:center;font-size:13.5px;box-shadow:0 12px 32px rgba(0,30,45,.28);width:max-content;max-width:calc(100vw - 24px);animation:oe-pop .2s ease-out}
+.oe-update>svg{flex:none;opacity:.85}
+.oe-update-t{display:grid;gap:1px;min-width:0;margin-right:4px}.oe-update-t b{font-weight:600}.oe-update-t span{font-size:12px;opacity:.78}
+.oe-update button{background:#fff;color:var(--navy);border:0;border-radius:8px;padding:8px 14px;font:inherit;font-weight:600;cursor:pointer;min-height:36px;white-space:nowrap}
+.oe-update button.later{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.32);font-weight:500}
+.oe-update button:disabled{opacity:.7;cursor:default}
 .oe-install{margin-top:12px;display:grid;gap:4px;font-size:12.5px;line-height:1.4;color:rgba(255,255,255,.8)}
 .oe-install button{margin-top:4px;justify-self:start}
 .collapsed .oe-install{display:none}
@@ -2133,6 +2166,9 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 /* phones: finger-sized controls, 16px fields (no iPhone zoom), notch and home-bar spacing */
 .oe-page{padding:20px max(16px,env(safe-area-inset-right,0px)) calc(48px + env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-left,0px))}
 .oe-push{padding:12px 16px}.oe-push .oe-actions{width:100%}.oe-push .oe-actions .oe-btn{flex:1 1 auto}
+/* phones: the update notice sits at the top, clear of the bottom action bars */
+.oe-update{top:calc(8px + env(safe-area-inset-top,0px));bottom:auto;left:8px;right:8px;transform:none;width:auto;max-width:none}
+.oe-update-t{flex:1 1 auto}.oe-update button{min-height:40px}
 .oe-side-x{display:grid;place-items:center;position:absolute;top:calc(10px + env(safe-area-inset-top,0px));right:8px;width:44px;height:44px;border:0;border-radius:8px;background:transparent;color:#fff;cursor:pointer}
 .oe .oe-input,.oe .oe-select,.oe .oe-textarea{font-size:16px;height:44px}
 .oe .oe-textarea{height:auto;min-height:88px}
@@ -2374,7 +2410,7 @@ function MoneyInput({ value, onChange, className = "", ...rest }) {
     ? ""
     : Number(value).toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return (
-    <input
+    <input name="shown"
       {...rest}
       className={`oe-input num ${className}`}
       inputMode="decimal"
@@ -2627,7 +2663,7 @@ function SearchBox({ value, onChange, placeholder }) {
   return (
     <div className="oe-search">
       <Icon name="search" size={16} />
-      <input className="oe-input" type="search" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} aria-label={placeholder} />
+      <input name="search" className="oe-input" type="search" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} aria-label={placeholder} />
     </div>
   );
 }
@@ -2697,7 +2733,7 @@ function UIProvider({ children }) {
             {dlg.body && <div>{dlg.body}</div>}
             {dlg.input && (
               <Field label={dlg.input.label} hint={dlg.input.required ? "Required" : "Optional"}>
-                <textarea className="oe-textarea" value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder={dlg.input.placeholder} />
+                <textarea name="answer" className="oe-textarea" value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder={dlg.input.placeholder} />
               </Field>
             )}
           </div>
@@ -2747,6 +2783,8 @@ function ProjectOptions({ projects }) {
 }
 
 /** Pages with unsaved input ask before the user navigates away, signs out or closes the tab. */
+/** The unsaved-changes guard of the open page, if any; read by UpdateBanner before it reloads the app. */
+let activeLeaveGuard = null;
 function useLeaveGuard(dirty, title, body) {
   const { setLeaveGuard } = useApp();
   useEffect(() => {
@@ -2756,6 +2794,7 @@ function useLeaveGuard(dirty, title, body) {
   useEffect(() => {
     if (!dirty) return undefined;
     const warn = (e) => {
+      if (window.__oeUpdating) return; // the person already chose to update and discard
       e.preventDefault();
       e.returnValue = "";
     };
@@ -3341,25 +3380,25 @@ function ReportPage() {
       </dl>
       <Filters>
         <SearchBox value={f.q} onChange={set("q")} placeholder="Search project ID, name or location" />
-        <select className="oe-select" value={f.year} onChange={set("year")} aria-label="Year">
+        <select name="year" className="oe-select" value={f.year} onChange={set("year")} aria-label="Year">
           <option value="">All years</option>
           {idx.years.map((y) => (
             <option key={y}>{y}</option>
           ))}
         </select>
-        <select className="oe-select" value={f.district} onChange={set("district")} aria-label="District">
+        <select name="district" className="oe-select" value={f.district} onChange={set("district")} aria-label="District">
           <option value="">All districts</option>
           {idx.districts.map((d) => (
             <option key={d}>{d}</option>
           ))}
         </select>
-        <select className="oe-select" value={f.group} onChange={set("group")} aria-label="Status group">
+        <select name="group" className="oe-select" value={f.group} onChange={set("group")} aria-label="Status group">
           <option value="">All statuses</option>
           {STATUS_GROUPS.map((g) => (
             <option key={g}>{g}</option>
           ))}
         </select>
-        <select className="oe-select" value={f.view} onChange={set("view")} aria-label="Columns">
+        <select name="view" className="oe-select" value={f.view} onChange={set("view")} aria-label="Columns">
           <option value="cat">Columns: categories</option>
           {idx.categories
             .filter((c) => c.is_active)
@@ -3369,12 +3408,12 @@ function ReportPage() {
               </option>
             ))}
         </select>
-        <select className="oe-select" value={f.show} onChange={set("show")} aria-label="Show">
+        <select name="show" className="oe-select" value={f.show} onChange={set("show")} aria-label="Show">
           <option value="">All projects</option>
           <option value="active">With requests</option>
           <option value="flagged">Over a limit</option>
         </select>
-        <select className="oe-select" value={f.sort} onChange={set("sort")} aria-label="Sort">
+        <select name="sort" className="oe-select" value={f.sort} onChange={set("sort")} aria-label="Sort">
           <option value="code">Sort by project ID</option>
           <option value="usage">Highest usage first</option>
           <option value="flags">Most limits exceeded</option>
@@ -3489,7 +3528,7 @@ function ProjectBreakdown({ project, focus }) {
             </p>
           </div>
           <label className="oe-check">
-            <input type="checkbox" checked={hideEmpty} onChange={(e) => setHideEmpty(e.target.checked)} /> Hide empty lines
+            <input name="hideempty" type="checkbox" checked={hideEmpty} onChange={(e) => setHideEmpty(e.target.checked)} /> Hide empty lines
           </label>
         </div>
         <div className="oe-panel-b" style={{ display: "grid", gap: 8 }}>
@@ -3682,19 +3721,19 @@ function ProjectsPage() {
       </PageHead>
       <Filters>
         <SearchBox value={f.q} onChange={set("q")} placeholder="Search ID, name, location, engineer" />
-        <select className="oe-select" value={f.year} onChange={set("year")} aria-label="Year">
+        <select name="year" className="oe-select" value={f.year} onChange={set("year")} aria-label="Year">
           <option value="">All years</option>
           {idx.years.map((y) => (
             <option key={y}>{y}</option>
           ))}
         </select>
-        <select className="oe-select" value={f.district} onChange={set("district")} aria-label="District">
+        <select name="district" className="oe-select" value={f.district} onChange={set("district")} aria-label="District">
           <option value="">All districts</option>
           {idx.districts.map((d) => (
             <option key={d}>{d}</option>
           ))}
         </select>
-        <select className="oe-select" value={f.group} onChange={set("group")} aria-label="Status group">
+        <select name="group" className="oe-select" value={f.group} onChange={set("group")} aria-label="Status group">
           <option value="">All statuses</option>
           {STATUS_GROUPS.map((g) => (
             <option key={g}>{g}</option>
@@ -3904,12 +3943,12 @@ function ProjectForm({ project, onClose }) {
 
   const T = (k, label, span = 4, extra = {}) => (
     <Field label={label} span={span} error={err[k]}>
-      <input className={`oe-input ${err[k] ? "bad" : ""}`} value={f[k] ?? ""} onChange={set(k)} {...extra} />
+      <input name={k} className={`oe-input ${err[k] ? "bad" : ""}`} value={f[k] ?? ""} onChange={set(k)} {...extra} />
     </Field>
   );
   const D = (k, label) => (
     <Field label={label} span={3}>
-      <input className="oe-input" type="date" value={f[k] || ""} onChange={set(k)} />
+      <input name={k} className="oe-input" type="date" value={f[k] || ""} onChange={set(k)} />
     </Field>
   );
   const M = (k, label, hint) => (
@@ -3947,7 +3986,7 @@ function ProjectForm({ project, onClose }) {
         {T("location", "Location", 6)}
         <Field label="Internal bucket" span={6} as="div" hint="For Advances or For assignment. No contract; allocations are set by hand.">
           <label className="oe-check" style={{ height: 36 }}>
-            <input type="checkbox" checked={Boolean(f.is_internal)} onChange={set("is_internal")} /> Not a contract project
+            <input name="is_internal" type="checkbox" checked={Boolean(f.is_internal)} onChange={set("is_internal")} /> Not a contract project
           </label>
         </Field>
         <div className="oe-sect">Amounts</div>
@@ -3961,14 +4000,14 @@ function ProjectForm({ project, onClose }) {
         {D("ntp_date", "NTP date")}
         {D("original_expiry", "Original expiry")}
         <Field label="Suspension / revised expiry notes" span={12}>
-          <textarea className="oe-textarea" value={f.suspension_notes || ""} onChange={set("suspension_notes")} />
+          <textarea name="suspension_notes" className="oe-textarea" value={f.suspension_notes || ""} onChange={set("suspension_notes")} />
         </Field>
         <div className="oe-sect">People and status</div>
         {T("site_engineer", "Site engineer", 3)}
         {T("checker", "Checker", 3)}
         {T("status", "Status", 3, { placeholder: "Ongoing" })}
         <Field label="Status group" span={3}>
-          <select className="oe-select" value={f.status_group || ""} onChange={set("status_group")}>
+          <select name="status_group" className="oe-select" value={f.status_group || ""} onChange={set("status_group")}>
             <option value="">None</option>
             {STATUS_GROUPS.map((g) => (
               <option key={g}>{g}</option>
@@ -4230,12 +4269,12 @@ function PayDaysAnalysis() {
       </p>
       <Filters style={{ marginBottom: 0 }}>
         <label className="oe-check small">
-          Disbursed from <input className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
+          Disbursed from <input name="from" className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
         </label>
         <label className="oe-check small">
-          to <input className="oe-input" type="date" value={f.to} onChange={set("to")} style={{ width: 150 }} />
+          to <input name="to" className="oe-input" type="date" value={f.to} onChange={set("to")} style={{ width: 150 }} />
         </label>
-        <select className="oe-select" value={f.liaison} onChange={set("liaison")} aria-label="Liaison">
+        <select name="liaison" className="oe-select" value={f.liaison} onChange={set("liaison")} aria-label="Liaison">
           <option value="">All liaisons</option>
           {liaisons.map(([id, name]) => (
             <option key={id} value={id}>
@@ -4244,7 +4283,7 @@ function PayDaysAnalysis() {
           ))}
         </select>
         <label className="oe-check small" title="Lines given to the client within this many days count as on time">
-          Target <input className="oe-input num" inputMode="numeric" value={f.target} onChange={set("target")} style={{ width: 64 }} /> days
+          Target <input name="target" className="oe-input num" inputMode="numeric" value={f.target} onChange={set("target")} style={{ width: 64 }} /> days
         </label>
         <span style={{ flex: 1 }} />
         <Button icon="download" onClick={exportCSV} disabled={!rows.length}>
@@ -4522,12 +4561,12 @@ function DisbDaysAnalysis() {
       </p>
       <Filters style={{ marginBottom: 0 }}>
         <label className="oe-check small">
-          Requested from <input className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
+          Requested from <input name="from" className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
         </label>
         <label className="oe-check small">
-          to <input className="oe-input" type="date" value={f.to} onChange={set("to")} style={{ width: 150 }} />
+          to <input name="to" className="oe-input" type="date" value={f.to} onChange={set("to")} style={{ width: 150 }} />
         </label>
-        <select className="oe-select" value={f.liaison} onChange={set("liaison")} aria-label="Liaison">
+        <select name="liaison" className="oe-select" value={f.liaison} onChange={set("liaison")} aria-label="Liaison">
           <option value="">All liaisons</option>
           {liaisons.map(([id, name]) => (
             <option key={id} value={id}>
@@ -4536,7 +4575,7 @@ function DisbDaysAnalysis() {
           ))}
         </select>
         <label className="oe-check small" title="Requests disbursed within this many days count as on time">
-          Target <input className="oe-input num" inputMode="numeric" value={f.target} onChange={set("target")} style={{ width: 64 }} /> days
+          Target <input name="target" className="oe-input num" inputMode="numeric" value={f.target} onChange={set("target")} style={{ width: 64 }} /> days
         </label>
         <span style={{ flex: 1 }} />
         <Button icon="download" onClick={exportCSV} disabled={!done.length && !pending.length}>
@@ -4871,12 +4910,12 @@ function ExpenseAnalysis() {
       </p>
       <Filters style={{ marginBottom: 0 }}>
         <label className="oe-check small">
-          Request date from <input className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
+          Request date from <input name="from" className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
         </label>
         <label className="oe-check small">
-          to <input className="oe-input" type="date" value={f.to} onChange={set("to")} style={{ width: 150 }} />
+          to <input name="to" className="oe-input" type="date" value={f.to} onChange={set("to")} style={{ width: 150 }} />
         </label>
-        <select className="oe-select" value={f.basis} onChange={set("basis")} aria-label="Amount basis">
+        <select name="basis" className="oe-select" value={f.basis} onChange={set("basis")} aria-label="Amount basis">
           {Object.entries(AMOUNT_BASIS).map(([k, v]) => (
             <option key={k} value={k}>
               {v.label}
@@ -5402,7 +5441,7 @@ function NewRequestPage({ params }) {
                 Request date <span className="oe-req">*</span>
               </span>
               <span>
-                <input className={`oe-input ${errors.head ? "bad" : ""}`} type="date" value={head.request_date} onChange={(e) => setHead((h) => ({ ...h, request_date: e.target.value }))} style={{ maxWidth: 190 }} />
+                <input name="request_date" className={`oe-input ${errors.head ? "bad" : ""}`} type="date" value={head.request_date} onChange={(e) => setHead((h) => ({ ...h, request_date: e.target.value }))} style={{ maxWidth: 190 }} />
                 {errors.head && <span className="oe-lerr small" style={{ display: "block", marginTop: 4 }}>{errors.head}</span>}
               </span>
             </label>
@@ -5420,7 +5459,7 @@ function NewRequestPage({ params }) {
                 Date needed <span className="oe-req">*</span>
               </span>
               <span>
-                <input
+                <input name="date_needed"
                   className={`oe-input ${errors.head_needed ? "bad" : ""}`}
                   type="date"
                   aria-required="true"
@@ -5440,7 +5479,7 @@ function NewRequestPage({ params }) {
                 Description <span className="oe-req">*</span>
               </span>
               <span>
-                <textarea
+                <textarea name="remarks"
                   className={`oe-textarea ${errors.head_desc ? "bad" : ""}`}
                   rows={3}
                   aria-required="true"
@@ -5649,7 +5688,7 @@ function ProjectPicker({ projects, value, onChange, invalid, label = "Project ID
 
   return (
     <div className="oe-combo">
-      <input
+      <input name={label}
         ref={inputRef}
         className={`oe-input ${invalid ? "bad" : ""}`}
         role="combobox"
@@ -5763,7 +5802,7 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
         <span className="oe-lf-t" aria-hidden="true">
           Category <span className="oe-req">*</span>
         </span>
-        <select
+        <select name="category_id"
           className={`oe-select ${errors.category_id ? "bad" : ""} ${l.category_id ? "" : "empty"}`}
           aria-label={`Line ${n} category`}
           value={l.category_id}
@@ -5783,7 +5822,7 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
         <span className="oe-lf-t" aria-hidden="true">
           Expense type <span className="oe-req">*</span>
         </span>
-        <select
+        <select name="type_id"
           className={`oe-select ${errors.type_id ? "bad" : ""} ${l.type_id ? "" : "empty"}`}
           aria-label={`Line ${n} expense type`}
           value={l.type_id}
@@ -5817,16 +5856,16 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
           <span className="oe-lf-t" aria-hidden="true">
             Payee / recipient <span className="oe-req">*</span>
           </span>
-          <input className={`oe-input ${errors.payee ? "bad" : ""}`} value={l.payee} onChange={(e) => onChange({ payee: e.target.value })} placeholder="Payee" aria-label={`Line ${n} payee`} aria-required="true" />
+          <input name="payee" className={`oe-input ${errors.payee ? "bad" : ""}`} value={l.payee} onChange={(e) => onChange({ payee: e.target.value })} placeholder="Payee" aria-label={`Line ${n} payee`} aria-required="true" />
         </span>
         <span className="oe-lf">
           <span className="oe-lf-t" aria-hidden="true">
             Remarks
           </span>
-          <input className="oe-input" value={l.description} onChange={(e) => onChange({ description: e.target.value })} placeholder="Optional" aria-label={`Line ${n} remarks`} />
+          <input name="description" className="oe-input" value={l.description} onChange={(e) => onChange({ description: e.target.value })} placeholder="Optional" aria-label={`Line ${n} remarks`} />
         </span>
         <span className="oe-lrow-act">
-          <input ref={fileRef} type="file" accept={DOC_ACCEPT} multiple hidden onChange={pickFiles} />
+          <input name="files" ref={fileRef} type="file" accept={DOC_ACCEPT} multiple hidden onChange={pickFiles} />
           <Button
             size="sm"
             variant="ghost"
@@ -5863,7 +5902,7 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
               {method === "collection_pct" && (
                 <>
                   <span className="muted">Billing</span>
-                  <input
+                  <input name="basis_pct"
                     className="oe-input num"
                     style={{ width: 64 }}
                     inputMode="decimal"
@@ -5886,7 +5925,7 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
                 aria-label={`Line ${n} ${method === "collection_pct" ? "net collection" : "contract value"}`}
               />
               <span className="muted oe-calc-gap">× {type.name}</span>
-              <input
+              <input name="rate"
                 className="oe-input num"
                 style={{ width: 64 }}
                 inputMode="decimal"
@@ -5909,7 +5948,7 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
               <span className="muted">
                 {type.detail_label} <span className="oe-req">*</span>
               </span>
-              <input className={`oe-input ${errors.detail ? "bad" : ""}`} style={{ width: 200 }} value={l.detail} onChange={(e) => onChange({ detail: e.target.value })} aria-label={`Line ${n} ${type.detail_label}`} aria-required="true" />
+              <input name="detail" className={`oe-input ${errors.detail ? "bad" : ""}`} style={{ width: 200 }} value={l.detail} onChange={(e) => onChange({ detail: e.target.value })} aria-label={`Line ${n} ${type.detail_label}`} aria-required="true" />
             </span>
           )}
           {l.approvedBefore != null && (
@@ -6037,6 +6076,159 @@ function ApprovalsPage({ params }) {
           <ApprovalDetail key={sel.id} request={sel} />
         </Drawer>
       )}
+    </div>
+  );
+}
+
+/** The edit that sent an approved request back for approval, if no approval has come since. */
+function reapprovalEdit(events) {
+  const sorted = [...(events || [])].sort((a, b) => (a.created_at > b.created_at ? 1 : a.created_at < b.created_at ? -1 : a.id - b.id));
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const e = sorted[i];
+    if (e.action === "approved" || e.action === "rejected") return null;
+    // history written before edits kept a snapshot only says "back to approval" in its note
+    if (e.action === "edited" && (e.changes ? e.changes.reapproval : / back to approval/.test(e.note || ""))) return e;
+  }
+  return null;
+}
+
+/** What changed on a request since the version that was approved: one row per changed detail, unchanged ones left out. */
+function reapprovalChanges(before, r, idx) {
+  const same = (a, b) => (typeof a === "number" || typeof b === "number" ? Math.abs((Number(a) || 0) - (Number(b) || 0)) < 0.005 : String(a ?? "").trim() === String(b ?? "").trim());
+  const show = (v) => (v == null || String(v).trim() === "" ? "—" : String(v));
+  const proj = (id) => (idx.projects.get(id) || {}).code || "?";
+  const type = (id) => (idx.typesById.get(id) || {}).name || "?";
+  const basis = (l) => (l.basis_amount != null && l.rate != null ? `${l.rate}% of ${money(l.basis_amount)}${l.basis_pct != null ? ` (${l.basis_pct}% collection)` : ""}` : null);
+  const summary = (l) => [`${proj(l.project_id)} ${type(l.type_id)}`, l.payee && `Payee: ${l.payee}`, money(l.amount)].filter(Boolean).join(", ");
+  const rows = [];
+  for (const [what, k, fmt] of [["Request date", "request_date", fmtDate], ["Date needed", "date_needed", fmtDate], ["Description", "remarks", show]]) {
+    if (!same(before[k], r[k])) rows.push({ line: "Request", what, before: fmt(before[k]), after: fmt(r[k]) });
+  }
+  const old = new Map(before.lines.map((l) => [l.id, l]));
+  for (const l of r.lines) {
+    const o = old.get(l.id);
+    if (!o) {
+      rows.push({ line: `Line ${l.line_no}`, what: "Line added", before: "—", after: summary(l), tone: "add" });
+      continue;
+    }
+    const line = o.line_no !== l.line_no ? `Line ${l.line_no} (was ${o.line_no})` : `Line ${l.line_no}`;
+    const t = idx.typesById.get(l.type_id);
+    const fields = [
+      ["Project", proj(o.project_id), proj(l.project_id)],
+      ["Expense type", type(o.type_id), type(l.type_id)],
+      ["Payee", o.payee, l.payee],
+      [(t && t.detail_label) || "Detail", o.detail, l.detail],
+      ["Particulars", o.description, l.description],
+      ["Basis", basis(o), basis(l)],
+    ];
+    for (const [what, a, b] of fields) if (!same(a, b)) rows.push({ line, what, before: show(a), after: show(b) });
+    if (!same(Number(o.amount), Number(l.amount))) {
+      rows.push({ line, what: "Requested amount", before: `${money(o.amount)}${o.approved_amount != null && !same(Number(o.approved_amount), Number(o.amount)) ? ` (approved ${money(o.approved_amount)})` : ""}`, after: money(l.amount), tone: "amount" });
+    }
+    const oldDocs = new Set((o.documents || []).map((d) => d.id));
+    const newDocs = new Set((l.documents || []).map((d) => d.id));
+    const added = (l.documents || []).filter((d) => !oldDocs.has(d.id)).map((d) => d.file_name);
+    const removed = (o.documents || []).filter((d) => !newDocs.has(d.id)).map((d) => d.file_name);
+    if (added.length || removed.length) rows.push({ line, what: "Documents", before: removed.length ? `Removed: ${removed.join(", ")}` : "—", after: added.length ? `Added: ${added.join(", ")}` : "—" });
+  }
+  const kept = new Set(r.lines.map((l) => l.id));
+  for (const o of before.lines) {
+    if (!kept.has(o.id)) rows.push({ line: `Line ${o.line_no} (old)`, what: "Line removed", before: `${summary(o)}${o.approved_amount != null ? `, approved ${money(o.approved_amount)}` : ""}`, after: "—", tone: "remove" });
+  }
+  return rows;
+}
+
+function ReapprovalChanges({ request: r }) {
+  const { api, idx } = useApp();
+  const [events, setEvents] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    api.loadEvents(r.id).then((ev) => alive && setEvents(ev)).catch(() => alive && setEvents([]));
+    return () => {
+      alive = false;
+    };
+  }, [r.id, r.updated_at, r.lines.length]); // eslint-disable-line react-hooks/exhaustive-deps
+  const edit = useMemo(() => reapprovalEdit(events), [events]);
+  const before = edit && edit.changes && edit.changes.before;
+  const rows = useMemo(() => (before ? reapprovalChanges(before, r, idx) : []), [before, r, idx]);
+  if (!edit) return null;
+  const wasApproved = before ? before.lines.reduce((a, l) => a + (l.approved_amount != null ? Number(l.approved_amount) : 0), 0) : null;
+  const wasRequested = before ? before.lines.reduce((a, l) => a + Number(l.amount), 0) : null;
+  const nowRequested = reqRequested(r);
+  return (
+    <div className="oe-panel-b oe-stack" style={{ borderTop: "1px solid var(--line)" }}>
+      <div className="oe-actions" style={{ alignItems: "center" }}>
+        <Chip tone="amber">Reapproval</Chip>
+        <span className="muted small">
+          {before && before.approved_by_name
+            ? `Approved by ${before.approved_by_name}${before.approved_at ? ` on ${fmtDate(before.approved_at)}` : ""} for ${money(wasApproved)}; `
+            : "Approved before; "}
+          edited by {edit.actor_name || "the liaison"} on {fmtDateTime(edit.created_at)}, so it needs approval again.
+          {before && before.erp_ref ? ` ERP reference ${before.erp_ref} was cleared.` : ""}
+        </span>
+      </div>
+      <details className="oe-fold" style={{ marginBottom: 0 }}>
+        <summary>
+          <span>
+            Change log
+            {before && rows.length > 0 && (
+              <span className="muted small" style={{ fontWeight: 400 }}>
+                {" "}
+                ({rows.length} {rows.length === 1 ? "change" : "changes"})
+              </span>
+            )}
+          </span>
+        </summary>
+        <div className="oe-stack" style={{ padding: "0 14px 14px" }}>
+          {before && before.approval_remarks && <p className="muted small">Earlier approval remarks: {before.approval_remarks}</p>}
+          {!before ? (
+            <p className="muted small">{edit.note ? `Change recorded: ${edit.note}.` : "The details of this edit were not recorded."}</p>
+          ) : rows.length === 0 ? (
+            <p className="muted small">Saved again with no changes to the details or lines.</p>
+          ) : (
+            <div className="oe-scrollx">
+              <table className="oe-table tight cards">
+                <thead>
+                  <tr>
+                    <th>Where</th>
+                    <th>What changed</th>
+                    <th>Before (approved)</th>
+                    <th>Now</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((x, i) => (
+                    <tr key={i}>
+                      <td className="lead">
+                        <b>{x.line}</b>
+                      </td>
+                      <td data-th="What changed">{x.what}</td>
+                      <td data-th="Before (approved)" style={{ color: x.tone === "remove" ? "var(--red)" : undefined }}>
+                        {x.before}
+                      </td>
+                      <td data-th="Now" style={{ color: x.tone === "add" ? "var(--green)" : undefined, fontWeight: x.tone === "amount" ? 600 : undefined }}>
+                        {x.after}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                {Math.abs(wasRequested - nowRequested) >= 0.005 && (
+                  <tfoot>
+                    <tr>
+                      <td className="lead">Total</td>
+                      <td data-th="What changed">Requested total</td>
+                      <td data-th="Before (approved)">{money(wasRequested)}</td>
+                      <td data-th="Now">
+                        <b>{money(nowRequested)}</b>
+                      </td>
+                    </tr>
+                  </tfoot>
+                )}
+              </table>
+            </div>
+          )}
+        </div>
+      </details>
     </div>
   );
 }
@@ -6220,6 +6412,7 @@ function ApprovalDetail({ request: r }) {
         <div className="oe-panel-b" style={{ paddingTop: 10, borderTop: "1px solid var(--line)" }}>
           <p className="muted small">Set a line to 0 to leave it out. Balance after = limit − approved − other requests still pending − this request. Lines of the same project and expense type are counted together.</p>
         </div>
+        <ReapprovalChanges request={r} />
       </div>
 
       <div className="oe-panel">
@@ -6227,7 +6420,7 @@ function ApprovalDetail({ request: r }) {
           <p className="muted small">Click a project ID above to see that project's report without leaving approvals.</p>
           {own && <Note tone="warn" icon="lock">You filed this request, so another approver has to approve it.</Note>}
           <Field label="Approval remarks" hint="Optional; saved with the request">
-            <textarea className="oe-textarea" value={remarks} onChange={(e) => setRemarks(e.target.value)} />
+            <textarea name="remarks" className="oe-textarea" value={remarks} onChange={(e) => setRemarks(e.target.value)} />
           </Field>
           {!phone && (
             <div className="oe-actions oe-approve-bar" style={{ justifyContent: "flex-end" }}>
@@ -6387,7 +6580,7 @@ function RequestsPage({ params }) {
       <Filters>
         <SearchBox value={f.q} onChange={set("q")} placeholder="Search reference, ERP ref, project, payee" />
         {seeAll && (
-          <select className="oe-select" value={f.requester} onChange={set("requester")} aria-label="Requested by">
+          <select name="requester" className="oe-select" value={f.requester} onChange={set("requester")} aria-label="Requested by">
             <option value={me.id}>Requested by me</option>
             <option value="">All requesters</option>
             {requesters.map(([id, name]) => (
@@ -6401,10 +6594,10 @@ function RequestsPage({ params }) {
           <ProjectPicker projects={data.projects} value={f.project} onChange={(id) => setF((x) => ({ ...x, project: id }))} label="Filter by project ID" allLabel="All projects" />
         </div>
         <label className="oe-check small">
-          From <input className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
+          From <input name="from" className="oe-input" type="date" value={f.from} onChange={set("from")} style={{ width: 150 }} />
         </label>
         <label className="oe-check small">
-          To <input className="oe-input" type="date" value={f.to} onChange={set("to")} style={{ width: 150 }} />
+          To <input name="to" className="oe-input" type="date" value={f.to} onChange={set("to")} style={{ width: 150 }} />
         </label>
       </Filters>
       {rows.length === 0 ? (
@@ -6596,13 +6789,13 @@ function ReturnFundModal({ r, line, onClose }) {
           <MoneyInput value={f.amount} onChange={set("amount")} aria-label="Amount returned" />
         </Field>
         <Field label="Date returned" span={7} error={err.return_date}>
-          <input type="date" className="oe-input" value={f.return_date} min={r.disbursed_date || undefined} max={todayISO()} onChange={set("return_date")} style={{ maxWidth: 200 }} />
+          <input name="return_date" type="date" className="oe-input" value={f.return_date} min={r.disbursed_date || undefined} max={todayISO()} onChange={set("return_date")} style={{ maxWidth: 200 }} />
         </Field>
         <Field label="Receipt or reference no." span={12} error={err.return_ref} hint="Official or acknowledgement receipt, or the Acumatica entry">
-          <input className="oe-input" value={f.return_ref} onChange={set("return_ref")} maxLength={80} data-autofocus />
+          <input name="return_ref" className="oe-input" value={f.return_ref} onChange={set("return_ref")} maxLength={80} data-autofocus />
         </Field>
         <Field label="Reason" span={12} error={err.return_reason}>
-          <textarea className="oe-input" rows={3} value={f.return_reason} onChange={set("return_reason")} maxLength={500} placeholder="For example: permit fee was lower, the rest returned" />
+          <textarea name="return_reason" className="oe-input" rows={3} value={f.return_reason} onChange={set("return_reason")} maxLength={500} placeholder="For example: permit fee was lower, the rest returned" />
         </Field>
       </div>
     </Modal>
@@ -6699,10 +6892,10 @@ function MarkPaidModal({ r, lines, onClose }) {
       </div>
       <div className="oe-grid">
         <Field label="Date given to client" span={5} error={err.date}>
-          <input className="oe-input" type="date" value={date} min={r.disbursed_date || undefined} max={todayISO()} onChange={(e) => { setDate(e.target.value); setErr((x) => ({ ...x, date: null })); }} />
+          <input name="date" className="oe-input" type="date" value={date} min={r.disbursed_date || undefined} max={todayISO()} onChange={(e) => { setDate(e.target.value); setErr((x) => ({ ...x, date: null })); }} />
         </Field>
         <Field label="Remarks" span={7} hint="Optional">
-          <input className="oe-input" value={remarks} onChange={(e) => setRemarks(e.target.value)} maxLength={300} />
+          <input name="remarks" className="oe-input" value={remarks} onChange={(e) => setRemarks(e.target.value)} maxLength={300} />
         </Field>
       </div>
     </Modal>
@@ -6964,7 +7157,7 @@ function RequestDrawer({ requestId, onClose }) {
               {can("requests.erp_ref") && mayTouch && (!r.erp_ref || editErp) ? (
                 <div className="oe-grid" style={{ alignItems: "end" }}>
                   <Field label="ERP reference number" span={6} hint="From Acumatica after you file the cash advance">
-                    <input className="oe-input" value={erp} onChange={(e) => setErp(e.target.value)} placeholder="e.g. CF-000123" />
+                    <input name="erp" className="oe-input" value={erp} onChange={(e) => setErp(e.target.value)} placeholder="e.g. CF-000123" />
                   </Field>
                   <div className="span-6 oe-actions">
                     <Button variant="primary" busy={busy} disabled={!erp.trim()} onClick={() => act(() => api.setErpRef(r.id, erp), "ERP reference saved")}>
@@ -6992,10 +7185,10 @@ function RequestDrawer({ requestId, onClose }) {
                   {r.erp_ref ? (
                     <div className="oe-grid" style={{ alignItems: "end" }}>
                       <Field label="Disbursement date" span={3}>
-                        <input className="oe-input" type="date" value={disb.date} onChange={(e) => setDisb((d) => ({ ...d, date: e.target.value }))} />
+                        <input name="date" className="oe-input" type="date" value={disb.date} onChange={(e) => setDisb((d) => ({ ...d, date: e.target.value }))} />
                       </Field>
                       <Field label="Accounting remarks" span={5}>
-                        <input className="oe-input" value={disb.remarks} onChange={(e) => setDisb((d) => ({ ...d, remarks: e.target.value }))} placeholder="Optional, e.g. check or voucher number" />
+                        <input name="remarks" className="oe-input" value={disb.remarks} onChange={(e) => setDisb((d) => ({ ...d, remarks: e.target.value }))} placeholder="Optional, e.g. check or voucher number" />
                       </Field>
                       <div className="span-4 oe-actions">
                         <Button variant="primary" busy={busy} disabled={!disb.date} onClick={() => act(() => api.disburseRequest(r.id, disb.date, disb.remarks), `${r.ref_no} marked disbursed`)}>
@@ -7018,7 +7211,7 @@ function RequestDrawer({ requestId, onClose }) {
           <h2>Request lines</h2>
           {selectableIds.length > 0 && (
             <label className="oe-check small">
-              <input
+              <input name="select_all"
                 type="checkbox"
                 checked={selectableIds.every((id) => sel.has(id))}
                 onChange={(e) => setSel(e.target.checked ? new Set(selectableIds) : new Set())}
@@ -7050,7 +7243,7 @@ function RequestDrawer({ requestId, onClose }) {
                 return (
                   <tr key={l.id} className={sel.has(l.id) ? "sel" : ["declined", "rejected", "cancelled", "returned"].includes(l.status) ? "muted-row" : ""}>
                     {selectableIds.length > 0 && (
-                      <td data-th="Select">{selectable(l) && <input type="checkbox" checked={sel.has(l.id)} onChange={() => toggle(l.id)} aria-label={`Select line ${l.line_no}`} />}</td>
+                      <td data-th="Select">{selectable(l) && <input name="select_line" type="checkbox" checked={sel.has(l.id)} onChange={() => toggle(l.id)} aria-label={`Select line ${l.line_no}`} />}</td>
                     )}
                     <td data-th="Line">{l.line_no}</td>
                     <td className="lead" style={{ minWidth: 240 }}>
@@ -7454,16 +7647,16 @@ function ReclassifyModal({ request: r, line: l, onClose }) {
                         <ProjectPicker projects={targets} value={x.project_id} onChange={(id) => setRow(x.key, { project_id: id })} invalid={!!errors[x.key] && !x.project_id} label={`Split row ${i + 1} project ID`} />
                       </td>
                       <td>
-                        <input className="oe-input" readOnly tabIndex={-1} value={cat ? cat.name : ""} aria-label="Category (from the original line)" title="From the original line" />
+                        <input name="category-from-the-original-line" className="oe-input" readOnly tabIndex={-1} value={cat ? cat.name : ""} aria-label="Category (from the original line)" title="From the original line" />
                       </td>
                       <td>
-                        <input className="oe-input" readOnly tabIndex={-1} value={type ? type.name : ""} aria-label="Expense type (from the original line)" title="From the original line" />
+                        <input name="expense-type-from-the-original-line" className="oe-input" readOnly tabIndex={-1} value={type ? type.name : ""} aria-label="Expense type (from the original line)" title="From the original line" />
                       </td>
                       <td>
                         <MoneyInput value={x.amount} onChange={(v) => setRow(x.key, { amount: v })} placeholder="0.00" aria-label={`Split row ${i + 1} amount`} className={errors[x.key] && !(Number(x.amount) > 0) ? "bad" : ""} />
                       </td>
                       <td>
-                        <input className="oe-input" value={x.remarks} onChange={(e) => setRow(x.key, { remarks: e.target.value })} placeholder="Optional, e.g. how the amount was identified" aria-label={`Split row ${i + 1} remarks`} />
+                        <input name="remarks" className="oe-input" value={x.remarks} onChange={(e) => setRow(x.key, { remarks: e.target.value })} placeholder="Optional, e.g. how the amount was identified" aria-label={`Split row ${i + 1} remarks`} />
                       </td>
                       <td className="r">
                         <Button size="sm" variant="ghost" icon="trash" aria-label={`Remove split row ${i + 1}`} onClick={() => setRows((rs) => rs.filter((y) => y.key !== x.key))} />
@@ -7573,7 +7766,7 @@ function AttachMore({ busy, onFiles, label = "Attach more" }) {
   const ref = useRef(null);
   return (
     <>
-      <input
+      <input name="files"
         ref={ref}
         type="file"
         accept={DOC_ACCEPT}
@@ -7999,16 +8192,16 @@ function CategoryForm({ cat, onClose }) {
     >
       <div className="oe-grid">
         <Field label="Category name">
-          <input className="oe-input" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="e.g. Bidding" />
+          <input name="name" className="oe-input" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="e.g. Bidding" />
         </Field>
         <Field as="div" hint="Inactive categories stay on old requests but can't be picked on new ones.">
           <label className="oe-check">
-            <input type="checkbox" checked={f.is_active} onChange={(e) => setF({ ...f, is_active: e.target.checked })} /> Active
+            <input name="is_active" type="checkbox" checked={f.is_active} onChange={(e) => setF({ ...f, is_active: e.target.checked })} /> Active
           </label>
         </Field>
         <Field as="div" hint="Liaisons must attach at least one PDF or image on every request line in this category; approvers can view it.">
           <label className="oe-check">
-            <input type="checkbox" checked={!!f.require_document} onChange={(e) => setF({ ...f, require_document: e.target.checked })} /> Require a supporting document
+            <input name="require_document" type="checkbox" checked={!!f.require_document} onChange={(e) => setF({ ...f, require_document: e.target.checked })} /> Require a supporting document
           </label>
         </Field>
       </div>
@@ -8059,7 +8252,7 @@ function TypeForm({ type, onClose }) {
     >
       <div className="oe-grid">
         <Field label="Category" span={6}>
-          <select className="oe-select" value={f.category_id} onChange={set("category_id")}>
+          <select name="category_id" className="oe-select" value={f.category_id} onChange={set("category_id")}>
             {idx.categories.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
@@ -8068,13 +8261,13 @@ function TypeForm({ type, onClose }) {
           </select>
         </Field>
         <Field label="Expense type" span={4}>
-          <input className="oe-input" value={f.name} onChange={set("name")} placeholder="e.g. Planning" />
+          <input name="name" className="oe-input" value={f.name} onChange={set("name")} placeholder="e.g. Planning" />
         </Field>
         <Field label="Code" span={2}>
-          <input className="oe-input" value={f.code} onChange={set("code")} placeholder="PLN" />
+          <input name="code" className="oe-input" value={f.code} onChange={set("code")} placeholder="PLN" />
         </Field>
         <Field label="Calculation on the request" span={6} hint="How the line amount is computed when filing">
-          <select className="oe-select" value={f.calc_method} onChange={set("calc_method")}>
+          <select name="calc_method" className="oe-select" value={f.calc_method} onChange={set("calc_method")}>
             {Object.entries(CALC_METHODS).map(([k, v]) => (
               <option key={k} value={k}>
                 {v}
@@ -8083,16 +8276,16 @@ function TypeForm({ type, onClose }) {
           </select>
         </Field>
         <Field label="Rate (%)" span={3} error={rateNeeded ? "Required for this calculation" : null} hint="Also the default allocation">
-          <input className="oe-input num" inputMode="decimal" value={f.rate} onChange={set("rate")} placeholder="e.g. 2" />
+          <input name="rate" className="oe-input num" inputMode="decimal" value={f.rate} onChange={set("rate")} placeholder="e.g. 2" />
         </Field>
         <Field label="Fixed allocation (₱)" span={3} hint="Per project, when no rate">
           <MoneyInput value={f.alloc_fixed} onChange={set("alloc_fixed")} />
         </Field>
         <Field label="Extra field on the line" span={6} hint="Optional label, e.g. Type of insurance">
-          <input className="oe-input" value={f.detail_label} onChange={set("detail_label")} />
+          <input name="detail_label" className="oe-input" value={f.detail_label} onChange={set("detail_label")} />
         </Field>
         <Field label="Acumatica item" span={6} hint="Shown as the Acumatica details on the printed request form">
-          <select className="oe-select" value={f.acumatica_item_id} onChange={set("acumatica_item_id")} style={{ color: f.acumatica_item_id ? undefined : "var(--amber)" }}>
+          <select name="acumatica_item_id" className="oe-select" value={f.acumatica_item_id} onChange={set("acumatica_item_id")} style={{ color: f.acumatica_item_id ? undefined : "var(--amber)" }}>
             <option value="">Not mapped yet</option>
             {[...(data.acumaticaItems || [])]
               .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
@@ -8105,7 +8298,7 @@ function TypeForm({ type, onClose }) {
         </Field>
         <Field as="div" span={12}>
           <label className="oe-check">
-            <input type="checkbox" checked={f.is_active} onChange={set("is_active")} /> Active, can be picked on new requests
+            <input name="is_active" type="checkbox" checked={f.is_active} onChange={set("is_active")} /> Active, can be picked on new requests
           </label>
         </Field>
       </div>
@@ -8158,8 +8351,8 @@ function AcumaticaMapping() {
           </div>
         </div>
         <Filters style={{ marginBottom: 12 }}>
-          <input className="oe-input" value={form.inv_id} onChange={(e) => setForm((f) => ({ ...f, inv_id: e.target.value }))} placeholder="INV ID, e.g. OPGAE0034" style={{ maxWidth: 200 }} aria-label="New item INV ID" maxLength={40} />
-          <input className="oe-input" value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} placeholder="Description" style={{ flex: 1, minWidth: 220 }} aria-label="New item description" maxLength={120} />
+          <input name="inv_id" className="oe-input" value={form.inv_id} onChange={(e) => setForm((f) => ({ ...f, inv_id: e.target.value }))} placeholder="INV ID, e.g. OPGAE0034" style={{ maxWidth: 200 }} aria-label="New item INV ID" maxLength={40} />
+          <input name="description" className="oe-input" value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} placeholder="Description" style={{ flex: 1, minWidth: 220 }} aria-label="New item description" maxLength={120} />
           <Button icon="plus" disabled={!form.inv_id.trim() || !form.description.trim()} onClick={addItem}>
             Add item
           </Button>
@@ -8182,14 +8375,14 @@ function AcumaticaMapping() {
                   <tr key={it.id}>
                     <td>
                       {ed ? (
-                        <input className="oe-input" value={editing.inv_id} onChange={(e) => setEditing((x) => ({ ...x, inv_id: e.target.value }))} aria-label="INV ID" maxLength={40} />
+                        <input name="inv_id" className="oe-input" value={editing.inv_id} onChange={(e) => setEditing((x) => ({ ...x, inv_id: e.target.value }))} aria-label="INV ID" maxLength={40} />
                       ) : (
                         <span className="oe-code">{it.inv_id}</span>
                       )}
                     </td>
                     <td>
                       {ed ? (
-                        <input className="oe-input" value={editing.description} onChange={(e) => setEditing((x) => ({ ...x, description: e.target.value }))} aria-label="Description" maxLength={120} />
+                        <input name="description" className="oe-input" value={editing.description} onChange={(e) => setEditing((x) => ({ ...x, description: e.target.value }))} aria-label="Description" maxLength={120} />
                       ) : (
                         it.description
                       )}
@@ -8273,9 +8466,9 @@ function DistrictRates() {
       </p>
       <Filters style={{ marginBottom: 0 }}>
         <label className="oe-check">
-          <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> Show all expense types
+          <input name="showall" type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> Show all expense types
         </label>
-        <input className="oe-input" value={newDistrict} onChange={(e) => setNewDistrict(e.target.value)} placeholder="Add a district" style={{ maxWidth: 200 }} />
+        <input name="newdistrict" className="oe-input" value={newDistrict} onChange={(e) => setNewDistrict(e.target.value)} placeholder="Add a district" style={{ maxWidth: 200 }} />
         <Button
           size="sm"
           icon="plus"
@@ -8314,7 +8507,7 @@ function DistrictRates() {
                 <td className="oe-code">{d}</td>
                 {types.map((t) => (
                   <td key={t.id} className="c">
-                    <input
+                    <input name="rate-for"
                       className="oe-input num"
                       style={{ width: 84, height: 32, margin: "0 auto" }}
                       inputMode="decimal"
@@ -8359,7 +8552,7 @@ function UsersAdmin() {
         <SearchBox value={q} onChange={setQ} placeholder="Search name or email" />
         {formerCount > 0 && (
           <label className="oe-check small">
-            <input type="checkbox" checked={showFormer} onChange={(e) => setShowFormer(e.target.checked)} /> Show {formerCount} deleted {formerCount === 1 ? "user" : "users"}
+            <input name="showformer" type="checkbox" checked={showFormer} onChange={(e) => setShowFormer(e.target.checked)} /> Show {formerCount} deleted {formerCount === 1 ? "user" : "users"}
           </label>
         )}
         <span style={{ flex: 1 }} />
@@ -8394,7 +8587,7 @@ function UsersAdmin() {
                   </td>
                   <td>{u.email}</td>
                   <td>
-                    <select className="oe-select" style={{ width: 200 }} value={u.role} disabled={self || adminLocked || gone} title={self ? "Another administrator must change your role" : adminLocked ? "Only an administrator can change an administrator" : undefined} onChange={(e) => save(u, { role: e.target.value }, "Role updated")} aria-label={`Role for ${u.full_name}`}>
+                    <select name="role" className="oe-select" style={{ width: 200 }} value={u.role} disabled={self || adminLocked || gone} title={self ? "Another administrator must change your role" : adminLocked ? "Only an administrator can change an administrator" : undefined} onChange={(e) => save(u, { role: e.target.value }, "Role updated")} aria-label={`Role for ${u.full_name}`}>
                       {roles.map((r) => (
                         <option key={r.role} value={r.role} disabled={r.role === "admin" && me.role !== "admin"}>
                           {r.label}
@@ -8475,13 +8668,13 @@ function InviteForm({ roles, onClose }) {
     >
       <div className="oe-grid">
         <Field label="Email">
-          <input className="oe-input" type="email" value={f.email} onChange={set("email")} placeholder="name@company.com" />
+          <input name="email" className="oe-input" type="email" value={f.email} onChange={set("email")} placeholder="name@company.com" />
         </Field>
         <Field label="Full name">
-          <input className="oe-input" value={f.full_name} onChange={set("full_name")} />
+          <input name="full_name" className="oe-input" value={f.full_name} onChange={set("full_name")} />
         </Field>
         <Field label="Role">
-          <select className="oe-select" value={f.role} onChange={set("role")}>
+          <select name="role" className="oe-select" value={f.role} onChange={set("role")}>
             {roles.map((r) => (
               <option key={r.role} value={r.role} disabled={r.role === "admin" && me.role !== "admin"}>
                 {r.label}
@@ -8627,7 +8820,7 @@ function RenameUser({ user, onClose }) {
       )}
     >
       <Field label="Full name" hint="Shown on requests and printed forms">
-        <input className="oe-input" value={name} onChange={(e) => setName(e.target.value)} />
+        <input name="name" className="oe-input" value={name} onChange={(e) => setName(e.target.value)} />
       </Field>
     </Modal>
   );
@@ -8695,7 +8888,7 @@ function AccessRights() {
       </div>
       {phone && (
         <Field label="Role" as="div">
-          <select className="oe-select" value={roleView || defaultRole || ""} onChange={(e) => setRoleView(e.target.value)} aria-label="Role to edit">
+          <select name="role_view" className="oe-select" value={roleView || defaultRole || ""} onChange={(e) => setRoleView(e.target.value)} aria-label="Role to edit">
             {roles.map((r) => (
               <option key={r.role} value={r.role}>
                 {r.label}
@@ -8738,7 +8931,7 @@ function AccessRights() {
                       const ownRole = me.role !== "admin" && r.role === me.role;
                       return (
                         <td key={r.role} className="c" title={barred ? `Not available to ${r.label}` : ownRole ? "You can't change your own role's rights" : undefined}>
-                          <input
+                          <input name={`${r.role}-${p.key}`}
                             type="checkbox"
                             checked={!barred && (r.role === "admin" || (draft[r.role] && draft[r.role].has(p.key)))}
                             disabled={r.role === "admin" || barred || ownRole}
@@ -8775,7 +8968,7 @@ function AccessRights() {
           )}
         >
           <Field label="Role name" hint="Starts with no permissions; tick them in the table after adding.">
-            <input className="oe-input" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="e.g. POD manager" />
+            <input name="label" className="oe-input" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="e.g. POD manager" />
           </Field>
         </Modal>
       )}
@@ -8814,7 +9007,7 @@ function SystemSettings() {
         <div className="oe-grid">
           <div className="oe-sect">Request reference</div>
           <Field label="Reference prefix" span={4} hint={`Next IDs look like ${(f.ref_prefix || "REQ").trim().toUpperCase()}-${year}-0001`}>
-            <input className="oe-input" value={f.ref_prefix} onChange={set("ref_prefix")} maxLength={10} />
+            <input name="ref_prefix" className="oe-input" value={f.ref_prefix} onChange={set("ref_prefix")} maxLength={10} />
           </Field>
           <div className="span-8" />
           <div className="oe-sect">Closing paid lines</div>
@@ -8828,10 +9021,10 @@ function SystemSettings() {
           </Field>
           <div className="oe-sect">Limits and security</div>
           <Field label="Near-limit warning at (%)" span={4} hint="Lines at or above this share of the allocation show a warning">
-            <input className="oe-input num" inputMode="numeric" value={f.near_limit_pct} onChange={set("near_limit_pct")} />
+            <input name="near_limit_pct" className="oe-input num" inputMode="numeric" value={f.near_limit_pct} onChange={set("near_limit_pct")} />
           </Field>
           <Field label="Sign out after inactivity (minutes)" span={4} hint="0 turns this off">
-            <input className="oe-input num" inputMode="numeric" value={f.idle_minutes} onChange={set("idle_minutes")} />
+            <input name="idle_minutes" className="oe-input num" inputMode="numeric" value={f.idle_minutes} onChange={set("idle_minutes")} />
           </Field>
           <div className="span-4" />
           {api.mode === "live" && (
@@ -8847,17 +9040,24 @@ function SystemSettings() {
                 }
               >
                 <label className="oe-check">
-                  <input type="checkbox" checked={DEMO_ENABLED && f.demo_enabled !== false} disabled={!DEMO_ENABLED} onChange={(e) => setF({ ...f, demo_enabled: e.target.checked })} /> Offer "Try the demo with sample data" on the sign-in page
+                  <input name="demo_enabled" type="checkbox" checked={DEMO_ENABLED && f.demo_enabled !== false} disabled={!DEMO_ENABLED} onChange={(e) => setF({ ...f, demo_enabled: e.target.checked })} /> Offer "Try the demo with sample data" on the sign-in page
                 </label>
               </Field>
             </>
           )}
           <div className="oe-sect">Printed form</div>
           <Field label="Form title" span={6}>
-            <input className="oe-input" value={f.form_title} onChange={set("form_title")} />
+            <input name="form_title" className="oe-input" value={f.form_title} onChange={set("form_title")} />
           </Field>
           <div className="span-12 oe-actions" style={{ justifyContent: "space-between", marginTop: 6 }}>
-            <span className="muted small">{LIVE ? `Connected to ${CONFIG.supabaseUrl.replace(/^https?:\/\//, "")}` : "Demo mode: settings reset on reload."}</span>
+            <span className="muted small">
+              {LIVE ? `Connected to ${CONFIG.supabaseUrl.replace(/^https?:\/\//, "")}` : "Demo mode: settings reset on reload."}
+              {APP_BUILD.time && (
+                <span style={{ display: "block" }}>
+                  Version {APP_BUILD.commit || "local"}, built {fmtDateTime(APP_BUILD.time)}
+                </span>
+              )}
+            </span>
             <Button variant="primary" busy={busy} onClick={save}>
               Save system settings
             </Button>
@@ -9182,7 +9382,7 @@ function Login({ api, onDone, onSwitchMode, demoOffered, notice }) {
             ) : (
               <>
                 <Field label="Email address">
-                  <input className="oe-input" type="email" autoComplete="email" inputMode="email" autoFocus value={email} onChange={(e) => setEmail(e.target.value)} />
+                  <input name="email" className="oe-input" type="email" autoComplete="email" inputMode="email" autoFocus value={email} onChange={(e) => setEmail(e.target.value)} />
                 </Field>
                 {captchaOn && <Captcha siteKey={CONFIG.captchaSiteKey} onToken={setCaptcha} resetKey={captchaReset} />}
                 {msg && <Note tone={msg.tone}>{msg.text}</Note>}
@@ -9204,7 +9404,7 @@ function Login({ api, onDone, onSwitchMode, demoOffered, notice }) {
               </p>
             </div>
             <Field label="Username" hint={CONFIG.usernameDomain ? null : "Your full company email address"}>
-              <input
+              <input name="username"
                 className="oe-input"
                 autoComplete="username"
                 autoCapitalize="none"
@@ -9227,7 +9427,7 @@ function Login({ api, onDone, onSwitchMode, demoOffered, notice }) {
               }
             >
               <div className="oe-pass">
-                <input
+                <input name="password"
                   className="oe-input"
                   type={show ? "text" : "password"}
                   autoComplete="current-password"
@@ -9329,14 +9529,14 @@ function SetPassword({ api, onDone, mode = "invite" }) {
           )}
           <Field label="New password" hint="At least 8 characters" as="div">
             <div className="oe-pass">
-              <input className="oe-input" type={show ? "text" : "password"} autoComplete="new-password" aria-label="New password" autoFocus value={a} onChange={(e) => setA(e.target.value)} />
+              <input name="new_password" className="oe-input" type={show ? "text" : "password"} autoComplete="new-password" aria-label="New password" autoFocus value={a} onChange={(e) => setA(e.target.value)} />
               <button type="button" onClick={() => setShow((v) => !v)} aria-label={show ? "Hide password" : "Show password"}>
                 {show ? "Hide" : "Show"}
               </button>
             </div>
           </Field>
           <Field label="Retype password">
-            <input className="oe-input" type={show ? "text" : "password"} autoComplete="new-password" value={b} onChange={(e) => setB(e.target.value)} />
+            <input name="confirm_password" className="oe-input" type={show ? "text" : "password"} autoComplete="new-password" value={b} onChange={(e) => setB(e.target.value)} />
           </Field>
           {err && <Note tone="bad">{err}</Note>}
           <Button type="submit" variant="primary" busy={busy} onClick={submit}>
@@ -9388,12 +9588,55 @@ const b64urlToBytes = (str) => {
   return out;
 };
 const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+/** Rejects with the message after ms; for browser steps that can otherwise wait forever. */
+const withTimeout = (promise, ms, message) =>
+  new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms);
+    Promise.resolve(promise).then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+const QUIET_HINT = "Your browser is hiding the permission request: click the bell or notification icon in the address bar and choose Allow.";
+/** Asks for notification permission. Chrome and Edge can hide the request behind an icon in the address bar
+ *  ("quieter prompts"); the browser's promise then stays open until the person clicks it. onWaiting is called when
+ *  that happens, and the answer still arrives once they give it. Gives up after ten minutes. */
+const askPermission = (onWaiting) =>
+  new Promise((resolve) => {
+    let done = false;
+    const finish = (p) => {
+      if (done) return;
+      done = true;
+      clearInterval(poll);
+      clearTimeout(hint);
+      clearTimeout(giveUp);
+      resolve(p);
+    };
+    Notification.requestPermission().then(finish, () => finish(Notification.permission));
+    // some browsers settle the permission without ever resolving the promise: watch the value as well
+    const poll = setInterval(() => Notification.permission !== "default" && finish(Notification.permission), 500);
+    const hint = setTimeout(() => Notification.permission === "default" && onWaiting(), 6000);
+    const giveUp = setTimeout(() => finish(Notification.permission), 10 * 60_000);
+  });
 /** Subscribes this browser (or keeps its subscription current) and saves it for the signed-in person. */
 async function pushSubscribe(api) {
-  const reg = await navigator.serviceWorker.getRegistration();
-  if (!reg) throw new Error("The app's service worker is not installed yet. Reload the page and try again.");
+  // the worker registers while the page loads: give a fresh tab a moment
+  const reg = await withTimeout(navigator.serviceWorker.ready, 8000, "The app's service worker is not installed yet. Reload the page and try again.");
   const key = b64urlToBytes(CONFIG.vapidPublicKey);
-  const subscribe = () => reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  // Chrome, Edge and Brave hand the request to their push service; when that is blocked (company network, Brave's
+  // "Use Google services for push messaging" off) some of them wait instead of failing
+  const subscribe = () =>
+    withTimeout(
+      reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }),
+      20000,
+      'The browser\'s push service did not answer. Check that the browser allows push messaging (Brave: turn on "Use Google services for push messaging") and that the network is not blocking it, then try again.'
+    );
   let sub = await reg.pushManager.getSubscription();
   // a subscription made with an older key pair cannot be used by the function: start over
   if (sub && sub.options && sub.options.applicationServerKey && !sameBytes(new Uint8Array(sub.options.applicationServerKey), key)) {
@@ -9437,6 +9680,8 @@ function usePush(api, ready, approver) {
     }
   });
   const [busy, setBusy] = useState(false);
+  const [quiet, setQuiet] = useState(false); // the browser is hiding the permission request behind an address-bar icon
+  const asking = useRef(false);
   // already allowed: keep the subscription current on every sign-in, silently
   useEffect(() => {
     if (offered && ready && perm === "granted") pushSubscribe(api).catch(() => {});
@@ -9444,8 +9689,13 @@ function usePush(api, ready, approver) {
   // saves this device's subscription, then asks the server for a test notification and reports what happened
   const sendTest = useCallback(
     async (okText) => {
-      await pushSubscribe(api);
-      const r = await api.pushTest();
+      await pushSubscribe(api); // from here on this device is signed up
+      let r;
+      try {
+        r = await api.pushTest();
+      } catch (e) {
+        return ui.err(`This device is signed up, but the test message could not be sent (${(e && e.message) || "unknown error"}). It will still get notifications.`);
+      }
       if (r && r.sent === 0)
         ui.err(r.failed ? "This device is signed up, but the push service refused the test message. Try again in a minute." : "This device could not be found for the test message. Turn notifications off and on again.");
       else ui.ok(okText);
@@ -9453,18 +9703,29 @@ function usePush(api, ready, approver) {
     [api, ui]
   );
   const enable = useCallback(async () => {
+    if (asking.current) return ui.err(QUIET_HINT); // the earlier request is still open in the address bar
     setBusy(true);
     try {
-      const p = await Notification.requestPermission(); // must follow a tap or click
+      asking.current = true;
+      // must follow a tap or click; a hidden prompt frees the button and shows where to find it
+      const p = await askPermission(() => {
+        setQuiet(true);
+        setBusy(false);
+      });
+      asking.current = false;
+      setQuiet(false);
+      setBusy(true);
       setPerm(p);
       if (p !== "granted") {
         if (p === "denied") ui.err("Notifications are blocked for this site. Allow them in the browser's site settings, then try again.");
+        else ui.err("Notifications were not allowed. Tap Turn on notifications again and choose Allow.");
         return;
       }
       await sendTest("Notifications are on. A test notification is on its way.");
     } catch (e) {
       ui.err((e && e.message) || "Notifications could not be turned on.");
     } finally {
+      asking.current = false;
       setBusy(false);
     }
   }, [ui, sendTest]);
@@ -9478,7 +9739,7 @@ function usePush(api, ready, approver) {
   }, []);
   const iosNeedsInstall = IS_IOS && !STANDALONE && !PUSH_SUPPORTED && api.mode === "live" && !!CONFIG.vapidPublicKey;
   const show = ready && !later && (offered ? perm === "default" || perm === "denied" : iosNeedsInstall);
-  return { show, perm, busy, enable, notNow, iosNeedsInstall, approver };
+  return { show, perm, busy, quiet, enable, notNow, iosNeedsInstall, approver };
 }
 /** Demo only: shows a sample notification on this device (there is no server in the demo to send a real one). */
 async function demoNotification(ui) {
@@ -9503,7 +9764,9 @@ function PushCard({ push }) {
     text = "Allow them in your browser's site settings (the icon left of the address), then reload this page.";
   } else {
     title = push.approver ? "Turn on notifications so you know when a request needs your approval" : "Turn on notifications to hear when your requests are approved or rejected";
-    text = `This device is told even when the app is closed, as long as it has internet.${push.approver ? " Approvers need this on." : ""}`;
+    text = push.quiet
+      ? `${QUIET_HINT} It carries on by itself once you do.`
+      : `This device is told even when the app is closed, as long as it has internet.${push.approver ? " Approvers need this on." : ""}`;
     action = (
       <Button size="sm" variant="primary" busy={push.busy} onClick={push.enable}>
         Turn on notifications
@@ -9782,6 +10045,7 @@ function Root() {
   const leaveGuard = useRef(null);
   const setLeaveGuard = useCallback((g) => {
     leaveGuard.current = g;
+    activeLeaveGuard = g;
   }, []);
   const confirmLeave = useCallback(async () => {
     const g = leaveGuard.current;
@@ -9789,6 +10053,7 @@ function Root() {
     const a = await ui.confirm({ title: g.title, body: g.body, confirmLabel: "Discard", cancelLabel: "Keep editing", tone: "danger", focusCancel: true, width: 420 });
     if (a === null) return false;
     leaveGuard.current = null;
+    activeLeaveGuard = null;
     return true;
   }, [ui]);
   const go = useCallback((p, prm = null) => {
@@ -9996,20 +10261,75 @@ function Root() {
   );
 }
 
-/** Installed-app updates: main.jsx raises oe-sw-update when a new build is waiting; reloading applies it. */
+/* Installed-app updates. main.jsx raises oe-sw-update when a new build has downloaded and is waiting.
+   - Just opened (first 15 seconds), nothing typed, no dialog open: switch to it straight away; the person sees
+     one quick reload at launch instead of a question.
+   - Otherwise: a banner with Update and Later. Update asks first if the page has unsaved changes. Later hides it
+     until the app comes back to the screen; the next launch updates by itself.
+   Updating is a normal reload served from the new files; the person stays signed in. */
+const APP_BUILD = typeof __APP_BUILD__ !== "undefined" ? __APP_BUILD__ : { commit: "", time: "" };
 function UpdateBanner() {
+  const ui = useUI();
   const [apply, setApply] = useState(() => (typeof window !== "undefined" && window.__oeSwUpdate) || null);
+  const [later, setLater] = useState(false);
+  const [busy, setBusy] = useState(false);
   useEffect(() => {
-    const on = (e) => setApply(() => e.detail);
+    const on = (e) => {
+      setApply(() => e.detail);
+      setLater(false);
+    };
+    const back = () => document.visibilityState === "visible" && setLater(false);
     window.addEventListener("oe-sw-update", on);
-    return () => window.removeEventListener("oe-sw-update", on);
+    document.addEventListener("visibilitychange", back);
+    return () => {
+      window.removeEventListener("oe-sw-update", on);
+      document.removeEventListener("visibilitychange", back);
+    };
   }, []);
-  if (!apply) return null;
+  const go = useCallback(() => {
+    if (!apply) return;
+    window.__oeUpdating = true;
+    setBusy(true);
+    Promise.resolve(apply()).catch(() => {
+      window.__oeUpdating = false;
+      setBusy(false);
+      ui.err("The update could not be applied. Close the app and open it again.");
+    });
+  }, [apply, ui]);
+  useEffect(() => {
+    if (!apply) return;
+    const justOpened = typeof performance !== "undefined" && performance.now() < 15000;
+    const typed = [...document.querySelectorAll("input:not([type=checkbox]):not([type=radio]):not([type=hidden]):not([type=file]), textarea")].some((e) => e.value && !e.readOnly);
+    if (justOpened && !activeLeaveGuard && !typed && !document.querySelector("[role=dialog]")) go();
+  }, [apply, go]);
+  const update = async () => {
+    if (activeLeaveGuard) {
+      const a = await ui.confirm({
+        title: "Update now?",
+        body: `${activeLeaveGuard.body} Updating reloads the app, so finish or save first if you want to keep it.`,
+        confirmLabel: "Update anyway",
+        cancelLabel: "Not yet",
+        tone: "danger",
+        focusCancel: true,
+        width: 440,
+      });
+      if (a === null) return;
+    }
+    go();
+  };
+  if (!apply || later) return null;
   return (
-    <div className="oe-update" role="status">
-      A new version is ready.
-      <button type="button" onClick={() => apply()}>
-        Reload
+    <div className="oe-update" role="status" aria-live="polite">
+      <Icon name="download" size={18} />
+      <div className="oe-update-t">
+        <b>A new version is ready</b>
+        <span>Takes a second. You stay signed in.</span>
+      </div>
+      <button type="button" className="later" onClick={() => setLater(true)} disabled={busy}>
+        Later
+      </button>
+      <button type="button" onClick={update} disabled={busy}>
+        {busy ? "Updating…" : "Update"}
       </button>
     </div>
   );

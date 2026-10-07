@@ -75,8 +75,10 @@ export async function vapidAuthorization(endpoint, { publicKey, privateKey, subj
   return `vapid t=${header}.${claims}.${b64url.encode(signature)}, k=${publicKey}`;
 }
 
-/** Sends one notification. Resolves to the push service's Response; 404 or 410 means the subscription is gone. */
-export async function sendPush(subscription, payload, vapid, { ttl = 24 * 3600, urgency = "high" } = {}) {
+/** Sends one notification. Resolves to the push service's Response; 404 or 410 means the subscription is gone.
+ *  A push service that does not answer within 15 seconds counts as failed, so one dead address can't hold the
+ *  function (and the person waiting on "Turn on notifications") until the function's own time limit. */
+export async function sendPush(subscription, payload, vapid, { ttl = 24 * 3600, urgency = "high", timeoutMs = 15_000 } = {}) {
   const body = await encrypt(enc.encode(JSON.stringify(payload)), subscription);
   return fetch(subscription.endpoint, {
     method: "POST",
@@ -88,5 +90,6 @@ export async function sendPush(subscription, payload, vapid, { ttl = 24 * 3600, 
       Urgency: urgency,
     },
     body,
+    signal: AbortSignal.timeout(timeoutMs),
   });
 }

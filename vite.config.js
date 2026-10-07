@@ -4,6 +4,10 @@ import { VitePWA } from "vite-plugin-pwa";
 
 // https://vite.dev/config/
 export default defineConfig({
+  // Which build is running, shown in Settings → System (Vercel provides the commit).
+  define: {
+    __APP_BUILD__: JSON.stringify({ commit: (process.env.VERCEL_GIT_COMMIT_SHA || "").slice(0, 7), time: new Date().toISOString() }),
+  },
   plugins: [
     react(),
     // Installable app for Android and iOS. The service worker caches only the app's own files (index.html, the
@@ -29,11 +33,16 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ["**/*.{js,css,html,svg,png,webmanifest}"],
+        // the Poppins files for Latin text and the peso sign (latin, latin-ext) open instantly and offline
+        globPatterns: ["**/*.{js,css,html,svg,png,webmanifest}", "assets/poppins-latin-*.woff2"],
         importScripts: ["sw-push.js"], // push notifications (public/sw-push.js)
         navigateFallback: "/index.html",
         runtimeCaching: [], // nothing from Supabase or any other site is cached
         cleanupOutdatedCaches: true,
+        // A freshly installed worker takes charge of the open page at once. Without this, a page opened before
+        // the worker existed (first visit, hard refresh, a just-installed app) is never controlled, so tapping
+        // Update on a later build had nothing to hand over to and the banner stayed on "Updating…".
+        clientsClaim: true,
       },
     }),
   ],
