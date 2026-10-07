@@ -131,7 +131,12 @@ for (const [w, h, name] of [
   check((await pg.locator(".oe-fold summary").count()) === 1, `${name} project report: filters fold behind a Filters bar`);
 
   await nav(pg, /Approvals/);
-  await fits(pg, `${name} approvals`);
+  await fits(pg, `${name} approvals queue`);
+  check((await pg.locator('input[aria-label^="Approve amount"]').count()) === 0, `${name} approvals: the queue shows alone until a request is tapped`);
+  await pg.locator(".oe-qitem").first().click();
+  await wait(pg);
+  check((await pg.locator("[role=dialog] .oe-approve-bar").count()) === 1, `${name} approvals: a tap opens the request in a full-screen drawer`);
+  await fits(pg, `${name} approvals drawer`);
   const amounts = pg.locator('input[aria-label^="Approve amount"]');
   const na = await amounts.count();
   let inView = 0;
@@ -140,10 +145,11 @@ for (const [w, h, name] of [
     if (r.left >= 0 && r.right <= r.vw) inView++;
   }
   check(na > 0 && inView === na, `${name} approvals: all ${na} approve-amount fields fit on screen`);
-  await pg.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await wait(pg, 300);
   const ab = await rect(pg.locator(".oe-approve-bar button").last());
-  check(ab.bottom <= ab.vh + 1 && ab.top >= 0, `${name} approvals: Approve button in reach at the bottom`);
+  check(ab.bottom <= ab.vh + 1 && ab.top >= 0, `${name} approvals: Approve button in reach without scrolling`);
+  await pg.keyboard.press("Escape");
+  await wait(pg, 400);
+  check((await pg.locator("[role=dialog]").count()) === 0, `${name} approvals: the drawer closes and the queue is back`);
 
   await nav(pg, /Request list/);
   await fits(pg, `${name} request list`);

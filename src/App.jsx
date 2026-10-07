@@ -1408,6 +1408,11 @@ function createSupabaseApi() {
       const client = await sb();
       return ok(client.from("oe_profiles").select("*").eq("id", userId).maybeSingle());
     },
+    // the only setting readable before sign-in: whether the sign-in page offers the demo
+    async getPublicSettings() {
+      const client = await sb();
+      return ok(client.rpc("oe_public_settings"));
+    },
     async getRoleLabel(role) {
       const client = await sb();
       const { data } = await client.from("oe_role_permissions").select("label").eq("role", role).maybeSingle();
@@ -1863,6 +1868,7 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-qitem{text-align:left;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;cursor:pointer;display:grid;gap:4px;width:100%}
 .oe-qitem:hover{border-color:var(--line-2)}.oe-qitem[aria-current=true]{border-color:var(--teal);box-shadow:0 0 0 1px var(--teal)}
 .oe-qitem .row{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.oe-qopen{font-size:12.5px;color:var(--teal-d);font-weight:500}
 .oe-line{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px 18px;display:grid;grid-template-columns:30px minmax(0,1fr);gap:14px}
 .oe-line.bad{border-color:#e6b3ad}
 .oe-line-no{width:28px;height:28px;border-radius:50%;background:var(--teal-50);color:var(--teal-d);font-weight:600;display:grid;place-items:center;font-size:13px}
@@ -2130,6 +2136,7 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 /* approvals: approve and reject stay in reach; new request: labelled line fields and a bottom bar */
 .oe-approve-bar{position:sticky;bottom:0;z-index:3;background:var(--surface);margin:0 -18px -16px;padding:10px 18px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line)}
 .oe-approve-bar .oe-btn{flex:1 1 auto}
+.oe-approve-float{display:flex;gap:8px;margin:0 -16px -32px;padding:10px 16px calc(10px + env(safe-area-inset-bottom,0px))}
 .oe-lgrid{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px 8px}
 .oe-lgrid>.oe-line-no{grid-column:1;grid-row:1}
 .oe-lgrid>.oe-lrow-act{grid-column:2;grid-row:1;justify-content:flex-end}
@@ -5916,7 +5923,10 @@ function ApprovalsPage({ params }) {
   const { data, idx, me, settings } = useApp();
   const queue = useMemo(() => data.requests.filter((r) => r.status === "on_hold").sort((a, b) => (a.created_at > b.created_at ? 1 : -1)), [data.requests]);
   const [selId, setSelId] = useState((params && params.requestId) || null);
-  const sel = queue.find((r) => r.id === selId) || queue[0] || null;
+  // phones: the queue alone, and a tap opens the request in a full-screen drawer (nothing is picked by default,
+  // and once a request is approved or rejected the drawer closes); desktops keep the queue beside the request
+  const phone = useIsPhone();
+  const sel = queue.find((r) => r.id === selId) || (phone ? null : queue[0] || null);
   const flags = useMemo(() => {
     const m = new Map();
     for (const r of queue) {
@@ -5937,13 +5947,14 @@ function ApprovalsPage({ params }) {
         <div className="oe-split">
           <nav className="oe-queue" aria-label="Requests waiting for approval">
             {queue.map((r) => (
-              <button key={r.id} className="oe-qitem" aria-current={sel && sel.id === r.id} onClick={() => setSelId(r.id)}>
+              <button key={r.id} className="oe-qitem" aria-current={sel && sel.id === r.id} aria-haspopup={phone ? "dialog" : undefined} onClick={() => setSelId(r.id)}>
                 <div className="row">
                   <span className="oe-code">{r.ref_no}</span>
                   <b className="num" style={{ color: "var(--ink)" }}>
                     {compact(reqRequested(r))}
                   </b>
                 </div>
+                {phone && <span className="oe-qopen">Tap to review</span>}
                 <div className="row muted small">
                   <span>
                     {r.liaison_name}, {fmtDate(r.request_date)}
@@ -5961,8 +5972,13 @@ function ApprovalsPage({ params }) {
               </button>
             ))}
           </nav>
-          {sel && <ApprovalDetail key={sel.id} request={sel} />}
+          {sel && !phone && <ApprovalDetail key={sel.id} request={sel} />}
         </div>
+      )}
+      {sel && phone && (
+        <Drawer title={`Review ${sel.ref_no}`} subtitle="Check each line, then approve or reject at the bottom." onClose={() => setSelId(null)}>
+          <ApprovalDetail key={sel.id} request={sel} />
+        </Drawer>
       )}
     </div>
   );
@@ -5976,6 +5992,7 @@ function ApprovalDetail({ request: r }) {
   const [projectFocus, setProjectFocus] = useState(null);
   const [viewer, setViewer] = useState(null);
   const own = r.liaison_id === me.id && me.role !== "admin";
+  const phone = useIsPhone(); // phones: Reject and Approve sit in a bar pinned to the bottom of the drawer
   const checks = useMemo(
     () => checkLines(r.lines.map((l) => ({ project_id: l.project_id, type_id: l.type_id, amount: amounts[l.id] ?? 0, requested: l.amount })), idx, settings, true),
     [r, amounts, idx, settings]
@@ -6013,6 +6030,16 @@ function ApprovalDetail({ request: r }) {
     setBusy(false);
   };
 
+  const actions = (
+    <>
+      <Button variant="danger" onClick={reject} disabled={busy}>
+        Reject
+      </Button>
+      <Button variant="primary" onClick={approve} busy={busy} disabled={own}>
+        Approve {money(approvedTotal)}
+      </Button>
+    </>
+  );
   return (
     <div className="oe-stack">
       <div className="oe-panel">
@@ -6145,16 +6172,14 @@ function ApprovalDetail({ request: r }) {
           <Field label="Approval remarks" hint="Optional; saved with the request">
             <textarea className="oe-textarea" value={remarks} onChange={(e) => setRemarks(e.target.value)} />
           </Field>
-          <div className="oe-actions oe-approve-bar" style={{ justifyContent: "flex-end" }}>
-            <Button variant="danger" onClick={reject} disabled={busy}>
-              Reject
-            </Button>
-            <Button variant="primary" onClick={approve} busy={busy} disabled={own}>
-              Approve {money(approvedTotal)}
-            </Button>
-          </div>
+          {!phone && (
+            <div className="oe-actions oe-approve-bar" style={{ justifyContent: "flex-end" }}>
+              {actions}
+            </div>
+          )}
         </div>
       </div>
+      {phone && <div className="oe-approve-bar oe-approve-float">{actions}</div>}
       {projectFocus && <ProjectDrawer projectId={projectFocus.projectId} initialTab="breakdown" focus={projectFocus} onClose={() => setProjectFocus(null)} />}
       {viewer && <DocumentViewer docs={viewer.docs} index={viewer.index} title={viewer.title} onClose={() => setViewer(null)} />}
     </div>
@@ -8595,6 +8620,7 @@ function SystemSettings() {
           ref_prefix: (f.ref_prefix || "REQ").trim().toUpperCase(),
           near_limit_pct: Math.min(100, Math.max(1, Number(f.near_limit_pct) || 90)),
           idle_minutes: Math.max(0, Number(f.idle_minutes) || 0),
+          demo_enabled: f.demo_enabled !== false,
         }),
       "System settings saved"
     );
@@ -8627,6 +8653,24 @@ function SystemSettings() {
             <input className="oe-input num" inputMode="numeric" value={f.idle_minutes} onChange={set("idle_minutes")} />
           </Field>
           <div className="span-4" />
+          {api.mode === "live" && (
+            <>
+              <div className="oe-sect">Sign-in page</div>
+              <Field
+                as="div"
+                span={12}
+                hint={
+                  DEMO_ENABLED
+                    ? "When off, the sign-in page no longer offers the demo. The demo only ever shows made-up sample data in the visitor's own browser."
+                    : "Turned off for this deployment (VITE_DEMO_ENABLED=false in the environment), so this switch has no effect."
+                }
+              >
+                <label className="oe-check">
+                  <input type="checkbox" checked={DEMO_ENABLED && f.demo_enabled !== false} disabled={!DEMO_ENABLED} onChange={(e) => setF({ ...f, demo_enabled: e.target.checked })} /> Offer "Try the demo with sample data" on the sign-in page
+                </label>
+              </Field>
+            </>
+          )}
           <div className="oe-sect">Printed form</div>
           <Field label="Form title" span={6}>
             <input className="oe-input" value={f.form_title} onChange={set("form_title")} />
@@ -8828,7 +8872,7 @@ function Captcha({ siteKey, onToken, resetKey }) {
   return <div ref={box} className="oe-captcha" />;
 }
 
-function Login({ api, onDone, onSwitchMode, notice }) {
+function Login({ api, onDone, onSwitchMode, demoOffered, notice }) {
   const [f, setF] = useState({ user: (notice && notice.user) || "", password: "" });
   const [show, setShow] = useState(false);
   const [msg, setMsg] = useState(notice ? { tone: notice.tone || "info", text: notice.text } : null);
@@ -8943,7 +8987,7 @@ function Login({ api, onDone, onSwitchMode, notice }) {
             <Button type="submit" variant="primary" busy={busy} onClick={submit}>
               Sign in
             </Button>
-            {onSwitchMode && DEMO_ENABLED && (
+            {onSwitchMode && demoOffered && (
               <>
                 <div className="oe-login-or">
                   <span>or</span>
@@ -9164,17 +9208,6 @@ function usePush(api, ready, approver) {
       setBusy(false);
     }
   }, [ui, sendTest]);
-  // the "Test notifications" button in the side panel, for a device that already allowed them
-  const test = useCallback(async () => {
-    setBusy(true);
-    try {
-      await sendTest("A test notification is on its way to your devices.");
-    } catch (e) {
-      ui.err((e && e.message) || "The test notification could not be sent.");
-    } finally {
-      setBusy(false);
-    }
-  }, [ui, sendTest]);
   const notNow = useCallback(() => {
     try {
       sessionStorage.setItem(PUSH_LATER_KEY, "1");
@@ -9185,7 +9218,19 @@ function usePush(api, ready, approver) {
   }, []);
   const iosNeedsInstall = IS_IOS && !STANDALONE && !PUSH_SUPPORTED && api.mode === "live" && !!CONFIG.vapidPublicKey;
   const show = ready && !later && (offered ? perm === "default" || perm === "denied" : iosNeedsInstall);
-  return { show, perm, busy, enable, test, granted: offered && perm === "granted", notNow, iosNeedsInstall, approver };
+  return { show, perm, busy, enable, notNow, iosNeedsInstall, approver };
+}
+/** Demo only: shows a sample notification on this device (there is no server in the demo to send a real one). */
+async function demoNotification(ui) {
+  if (!("Notification" in window)) return ui.err("This browser does not support notifications.");
+  const p = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
+  if (p !== "granted") return ui.err("Notifications are blocked for this site. Allow them in the browser's site settings, then try again.");
+  // no page address: tapping it only brings the demo back to the front (opening a page would restart the demo)
+  const opts = { body: "REQ-2026-0007 from Mae, \u20B178,000.00 (demo sample)", icon: "/icons/icon-192.png", badge: "/icons/badge-96.png", tag: "oe-demo" };
+  const reg = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration() : null;
+  if (reg) await reg.showNotification("Request for approval", opts);
+  else new Notification("Request for approval", opts);
+  ui.ok("A sample notification was shown on this device. On the live system, approvers get these when a request is filed.");
 }
 function PushCard({ push }) {
   if (!push.show) return null;
@@ -9222,43 +9267,6 @@ function PushCard({ push }) {
   );
 }
 
-/* "Needs my action" count on the favicon (browser tabs) and the app icon (installed app). */
-let faviconImage = null;
-function setFaviconBadge(n) {
-  const link = document.querySelector('link[rel="icon"]');
-  if (!link || /jsdom/i.test(navigator.userAgent)) return;
-  if (!n) {
-    link.href = "/favicon.svg";
-    link.type = "image/svg+xml";
-    return;
-  }
-  const draw = () => {
-    const c = document.createElement("canvas");
-    c.width = c.height = 64;
-    const g = c.getContext("2d");
-    if (!g) return;
-    g.drawImage(faviconImage, 0, 0, 64, 64);
-    const label = n > 99 ? "99+" : String(n);
-    g.font = "bold 26px Poppins, Arial, sans-serif";
-    const w = Math.max(30, g.measureText(label).width + 14);
-    g.fillStyle = "#d03a2a";
-    g.beginPath();
-    g.arc(64 - w + 15, 15, 15, Math.PI / 2, Math.PI * 1.5);
-    g.arc(64 - 15, 15, 15, -Math.PI / 2, Math.PI / 2);
-    g.closePath();
-    g.fill();
-    g.fillStyle = "#fff";
-    g.textAlign = "center";
-    g.textBaseline = "middle";
-    g.fillText(label, 64 - w / 2, 16);
-    link.href = c.toDataURL("image/png");
-    link.type = "image/png";
-  };
-  if (faviconImage && faviconImage.complete) return draw();
-  faviconImage = new Image();
-  faviconImage.onload = draw;
-  faviconImage.src = "/favicon.svg";
-}
 const pageFromPath = (path) => {
   const clean = (path || "").replace(/\/+$/, "").toLowerCase();
   return (NAV.find((n) => n.path === clean) || {}).id || null;
@@ -9342,9 +9350,15 @@ function Root() {
   const [popTick, setPopTick] = useState(0); // bumped on browser back/forward so the address is re-checked
   const addressMode = useRef("replace"); // "push" when the next address change is a module the person chose
   const [loginNotice, setLoginNotice] = useState(takeSignInNotice); // shown on the sign-in page after an invite's password is set
+  // "Try the demo" on the live sign-in page: VITE_DEMO_ENABLED=false turns it off for the deployment;
+  // otherwise administrators switch it in Settings → System. Hidden until the setting is known.
+  const [demoOn, setDemoOn] = useState(LIVE ? null : DEMO_ENABLED);
+  const demoRef = useRef(demoOn);
+  demoRef.current = demoOn;
+  const demoOffered = DEMO_ENABLED && demoOn === true;
   const switchMode = useCallback((m) => {
     if (m === "live" && !LIVE) return;
-    if (m === "demo" && !DEMO_ENABLED) return;
+    if (m === "demo" && (!DEMO_ENABLED || (LIVE && demoRef.current !== true))) return;
     setPage(null);
     setParams(null);
     setAuth({ status: "loading" });
@@ -9533,10 +9547,9 @@ function Root() {
   }, [data, me, can, idx]);
 
   const push = usePush(api, auth.status === "ready", can("requests.approve"));
-  // "Needs my action" count on the tab title, the favicon and the installed app's icon
+  // "Needs my action" count on the tab title and the installed app's icon
   const actionCount = auth.status === "ready" ? badges.requests || 0 : 0;
   useEffect(() => {
-    setFaviconBadge(actionCount);
     if (navigator.setAppBadge) (actionCount ? navigator.setAppBadge(actionCount) : navigator.clearAppBadge()).catch(() => {});
   }, [actionCount]);
 
@@ -9572,6 +9585,18 @@ function Root() {
     return () => window.removeEventListener("popstate", onPop);
   }, [auth.status, current, confirmLeave]);
 
+  useEffect(() => {
+    if (!LIVE || !DEMO_ENABLED || auth.status !== "signed_out" || api.mode !== "live") return undefined;
+    let alive = true;
+    api
+      .getPublicSettings()
+      .then((p) => alive && setDemoOn(!(p && p.demo_enabled === false)))
+      .catch(() => alive && setDemoOn(true)); // database not updated yet, or offline: behave as before
+    return () => {
+      alive = false;
+    };
+  }, [auth.status, api]);
+
   // the browser tab stays neutral until someone is signed in
   const tabTitle = auth.status === "ready" ? `${actionCount ? `(${actionCount}) ` : ""}Project Expense Monitoring` : auth.status === "set_password" ? "Set your password" : "Sign in";
   useEffect(() => {
@@ -9596,7 +9621,7 @@ function Root() {
         </div>
       </div>
     );
-  if (auth.status === "signed_out") return <Login key={loginNotice ? "after-invite" : "plain"} api={api} onDone={enter} onSwitchMode={LIVE ? switchMode : null} notice={loginNotice} />;
+  if (auth.status === "signed_out") return <Login key={loginNotice ? "after-invite" : "plain"} api={api} onDone={enter} onSwitchMode={LIVE ? switchMode : null} demoOffered={demoOffered} notice={loginNotice} />;
   if (auth.status === "set_password") return <SetPassword api={api} onDone={passwordSet} />;
   if (auth.status === "inactive")
     return (
@@ -9658,8 +9683,8 @@ function Root() {
               <button onClick={async () => (await confirmLeave()) && signOut()} title={collapsed ? "Sign out" : undefined} aria-label="Sign out">
                 <Icon name="logout" size={14} /> <span className="lbl">Sign out</span>
               </button>
-              {push.granted && (
-                <button onClick={push.test} disabled={push.busy} title={collapsed ? "Test notifications" : undefined} aria-label="Test notifications">
+              {api.mode === "demo" && typeof window !== "undefined" && "Notification" in window && (
+                <button onClick={() => demoNotification(ui).catch((e) => ui.err((e && e.message) || "The sample notification could not be shown."))} title={collapsed ? "Test notifications" : undefined} aria-label="Test notifications">
                   <Icon name="bell" size={14} /> <span className="lbl">Test notifications</span>
                 </button>
               )}

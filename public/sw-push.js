@@ -27,11 +27,12 @@ self.addEventListener("push", (event) => {
 // Tapping the notification opens the app on the page it names, reusing an open tab when there is one.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const url = new URL((event.notification.data && event.notification.data.url) || "/", self.location.origin).href;
+  const target = event.notification.data && event.notification.data.url; // none = just bring the app to the front
+  const url = new URL(target || "/", self.location.origin).href;
   event.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
       const open = list.find((c) => c.url.startsWith(self.location.origin));
-      if (open) return open.focus().then((c) => (c && c.navigate ? c.navigate(url) : c));
+      if (open) return open.focus().then((c) => (target && c && c.navigate ? c.navigate(url) : c));
       return self.clients.openWindow(url);
     })
   );

@@ -81,7 +81,7 @@ What people see: after signing in, a bar offers **Turn on notifications** (appro
 
 - **Android and desktop (Chrome, Edge, Firefox):** work in the browser and in the installed app.
 - **iPhone and iPad:** notifications work only in the app added to the Home Screen (iOS 16.4 or later); the bar explains this in Safari.
-- **Badge:** the "Needs my action" count shows on the installed app's icon, in the tab title, and as a red counter on the favicon.
+- **Badge:** the "Needs my action" count shows on the installed app's icon and in the tab title, for example "(3) Project Expense Monitoring".
 - **What is sent:** the reference number, who filed it and the amount; nothing more. The notification opens Approvals or the Request list.
 - **Camera:** attaching a document from the phone camera works through the file picker; no camera permission is asked for.
 
@@ -98,7 +98,9 @@ Without `VITE_VAPID_PUBLIC_KEY` the bar is never shown and the app works as befo
 
 ## Sign-in page
 
-The sign-in page is deliberately unbranded: no logo, company name or system name, and the browser tab reads "Sign in" until someone signs in. The background is a contour-map pattern drawn by the app itself, so nothing is loaded from outside. The database shares nothing with visitors who have not signed in.
+The sign-in page is deliberately unbranded: no logo, company name or system name, and the browser tab reads "Sign in" until someone signs in. The background is a contour-map pattern drawn by the app itself, so nothing is loaded from outside. The database shares nothing with visitors who have not signed in, except one yes/no: whether to offer the demo (`oe_public_settings()`).
+
+**Demo on the live sign-in page.** Administrators switch *Try the demo with sample data* on or off in **Settings → System → Sign-in page** (on by default). Off hides the link and the demo can't be opened from the sign-in page; people already in the demo can finish. The demo only ever shows made-up sample data in the visitor's own browser. Setting `VITE_DEMO_ENABLED=false` in the environment turns the demo off for that deployment regardless of the switch. Needs the migration `20261007000000_oe_public_settings.sql` (`npm run db:push`); until it is applied the link stays visible.
 
 Upgrading from a version that had a company logo: rerunning `supabase_schema.sql` deletes the stored logo and its settings. For the same reason, set the `<title>` of the page you host the app in to something neutral such as "Sign in"; the app changes it after sign-in.
 
@@ -122,7 +124,7 @@ After signing in, the app opens the first module the person's role can see (Proj
 
 The same build works on three screen sizes; nothing changes for desktops (961px and wider).
 
-- **Phones (up to 767px):** the side panel becomes a slide-out menu from the ☰ button. Wide tables (Project report, Project listing, Request list, Approvals lines, request details lines) show as stacked cards with the column name beside each value; other tables keep their first column pinned while scrolling sideways. Filters fold behind a *Filters and search* bar, the Request list shows three status cards until *All statuses* is tapped, each request line in New request has labelled fields with the total and Submit in a bar at the bottom, Approve and Reject stay at the bottom of the screen, Access rights shows one role at a time (chosen from a list), and fields are 16px so iPhones don't zoom in. Hovering details (the allocation meters, status chips) show on tap.
+- **Phones (up to 767px):** the side panel becomes a slide-out menu from the ☰ button. Wide tables (Project report, Project listing, Request list, Approvals lines, request details lines) show as stacked cards with the column name beside each value; other tables keep their first column pinned while scrolling sideways. Filters fold behind a *Filters and search* bar, the Request list shows three status cards until *All statuses* is tapped, each request line in New request has labelled fields with the total and Submit in a bar at the bottom, Approvals shows only the queue, and tapping a request opens it in a full-screen panel with Reject and Approve pinned at the bottom (it closes once the request is decided), Access rights shows one role at a time (chosen from a list), and fields are 16px so iPhones don't zoom in. Hovering details (the allocation meters, status chips) show on tap.
 - **Tablets (768 to 960px):** the side panel is always the icon strip, so the page gets the width.
 - **Installed app (PWA):** on Android phones and tablets, an *Install app* button appears next to Sign out in the side panel when the browser allows installing. Desktops don't get the button, because Chrome and Edge already show an install icon in the address bar. On iPhone and iPad, Safari users tap Share, then *Add to Home Screen*; the app shows that hint once. The installed app opens full screen with the green logo (`public/favicon.svg`, rendered to `public/icons/` by `npm run icons`). The service worker caches only the app's own files, never project or request data; offline, it opens and says *You're offline*. After a deploy, an open app shows *A new version is ready, Reload*. Invite emails still open in the browser; sign in from the installed app afterwards.
 

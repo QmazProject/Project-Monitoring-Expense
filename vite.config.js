@@ -20,7 +20,7 @@ export default defineConfig({
         scope: "/",
         display: "standalone",
         orientation: "any",
-        background_color: "#0b4338",
+        background_color: "#eef3f2", // launch screen: the light page colour, with the green logo on it
         theme_color: "#0b4338",
         icons: [
           { src: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
