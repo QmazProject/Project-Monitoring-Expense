@@ -80,7 +80,8 @@ Deno.serve(async (req) => {
 
   // Never overwrite an existing account (including the caller's own) through an invite.
   const pattern = email.replace(/[\\%_]/g, (ch) => "\\" + ch); // literal match: % and _ are wildcards in ilike
-  const { data: existing, error: existingErr } = await admin.from("oe_profiles").select("id").ilike("email", pattern).maybeSingle();
+  // a deleted user's profile row may remain (it keeps their name on old records); that email may be invited again
+  const { data: existing, error: existingErr } = await admin.from("oe_profiles").select("id").ilike("email", pattern).is("deleted_at", null).maybeSingle();
   if (existingErr) return json({ error: existingErr.message }, 500);
   if (existing) return json({ error: "That email already has an account. Change its role or access in the Users list instead." }, 409);
 

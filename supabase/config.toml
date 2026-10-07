@@ -251,6 +251,11 @@ otp_expiry = 3600
 subject = "You're invited to Project Expense Monitoring"
 content_path = "./supabase/templates/invite.html"
 
+# "Forgot password?" on the sign-in page. The link returns to /reset-password in the app.
+[auth.email.template.recovery]
+subject = "Reset your Project Expense Monitoring password"
+content_path = "./supabase/templates/recovery.html"
+
 # Uncomment to customize notification email template
 # [auth.email.notification.password_changed]
 # enabled = true
@@ -423,4 +428,8 @@ verify_jwt = false
 
 [functions.oe-push]
 # Same: the function checks the caller's token itself before sending any notification.
+verify_jwt = false
+
+[functions.oe-delete-user]
+# Same: the function checks the caller's token and permission itself.
 verify_jwt = false

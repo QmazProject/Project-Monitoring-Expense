@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "db:push": "supabase db push",
-    "functions:deploy": "supabase functions deploy oe-invite-user && supabase functions deploy oe-push",
+    "functions:deploy": "supabase functions deploy oe-invite-user && supabase functions deploy oe-push && supabase functions deploy oe-delete-user",
     "bootstrap:users": "node scripts/bootstrap-users.mjs",
     "icons": "node scripts/make-icons.mjs",
     "push:keys": "node scripts/make-vapid-keys.mjs",

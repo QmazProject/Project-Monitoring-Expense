@@ -11,7 +11,9 @@ Three pieces: the database (`supabase_schema.sql`), one edge function for inviti
 ## 2. Sign-in settings
 
 1. **Authentication → Sign In / Providers**: turn off *Allow new users to sign up*. People only get in by invite.
-2. **Authentication → URL Configuration**: set *Site URL* to the app's address and add `https://<the app's address>/**` under *Redirect URLs*. Invite links return to `/invite/set-password`, the page where the person chooses their password.
+2. **Authentication → URL Configuration**: set *Site URL* to the app's address and add `https://<the app's address>/**` under *Redirect URLs*. Invite links return to `/invite/set-password`, the page where the person chooses their password; password-reset links return to `/reset-password`.
+
+**Forgot password.** *Forgot password?* beside the Password label on the sign-in page asks for the person's email and sends a reset link (the reply is the same whether or not the address has an account). The link opens `/reset-password`, where they type the new password twice; they are then sent to the sign-in page to use it. The email uses `supabase/templates/recovery.html`, in the same design as the invite; both templates are set in `supabase/config.toml` and applied with `supabase config push`. Links work once and expire after an hour (`otp_expiry`). Administrators can still set a password directly with `select oe_set_login_password('email', 'new password')` in the SQL Editor.
 
 ## 3. First administrator
 
@@ -51,6 +53,8 @@ The role shown in the email comes from the invite function (`role_label` in the 
 Each row shows *Pending* (invited, hasn't set a password yet) or *Accepted* (password set). This needs migration `20261003000000_oe_invite_status.sql` (`supabase db push`), which also fills in the status for invites sent earlier.
 
 The same stamp protects the invite: a person whose invite is still *Pending* can only ever reach the *Set your password* page, however they arrive (the email button, the plain link, a second click, a saved session, or typing the address). Opening an invite link a second time shows the sign-in page with "That link was already used or has expired".
+
+**Deleting a user.** The trash button on a row (not your own, and only an administrator can delete an administrator) removes the person's sign-in so the email can be invited again. The confirmation first checks their records: someone with none is removed completely; someone who filed, approved or touched anything is shown a summary (requests, approvals, documents, history, requests still in progress) and, if deleted anyway, keeps a profile row marked *Deleted* so their name stays on every record. *Show deleted users* in the Users tab lists those rows. Needs `20261007000001_oe_delete_user.sql` and the `oe-delete-user` function.
 
 The set-password tab keeps its session in memory only. It never writes to the browser's saved sign-in, so an administrator who is signed in on the same computer stays signed in while an invite is accepted there. When the password is confirmed, the tab reloads as the normal sign-in page with the person's email filled in.
 
@@ -110,6 +114,7 @@ Upgrading from a version that had a company logo: rerunning `supabase_schema.sql
 |---|---|
 | `/sign-in` | Sign-in page |
 | `/invite/set-password` | Set your password (invite links) |
+| `/reset-password` | Choose a new password (Forgot password? links) |
 | `/project-report` | Project report, the first screen after signing in |
 | `/new-request` | New request |
 | `/approvals` | Approvals |

@@ -41,12 +41,15 @@ const NEEDS_PASSWORD = /type=(invite|recovery)/.test(INITIAL_HASH);
 /** The set-password page's own address. Invite emails return here (vercel.json rewrites it to the app). */
 const INVITE_PATH = "/invite/set-password";
 const INITIAL_PATH = typeof window !== "undefined" ? window.location.pathname : "/";
+/** The choose-a-new-password page ("Forgot password?"). Reset emails return here (vercel.json rewrites it to the app). */
+const RESET_PATH = "/reset-password";
+const RESET_FLOW = /type=recovery/.test(INITIAL_HASH) || INITIAL_PATH === RESET_PATH;
 /** The sign-in page's address. Each module has its own address too (see NAV). */
 const SIGNIN_PATH = "/sign-in";
 /* This tab is only here to set a password. Its session is kept in memory and never written to the browser's
    storage, so it cannot replace or sign out an administrator who is signed in on the same computer. When it is
    finished it reloads the sign-in page, which uses the normal, persistent session again. */
-const INVITE_TAB = INITIAL_PATH === INVITE_PATH || NEEDS_PASSWORD;
+const INVITE_TAB = INITIAL_PATH === INVITE_PATH || INITIAL_PATH === RESET_PATH || NEEDS_PASSWORD; // the invite or reset tab
 const NOTICE_KEY = "oe-signin-notice"; // sessionStorage (this tab only): message for the sign-in page after a reload
 const handoffToSignIn = (notice) => {
   try {
@@ -924,6 +927,7 @@ function createDemoApi() {
       return { id: p.id };
     },
     async signOut() { me = null; },
+    async resetPassword() { throw new Error("The demo has no passwords to reset."); },
     async savePushSubscription() {}, async removePushSubscription() {}, async pushTest() {},
     async updatePassword() {},
     async getProfile() { return clone(profile() || null); },
@@ -1304,9 +1308,38 @@ function createDemoApi() {
     inviteUser: ({ email, full_name, role }) => mutate(() => {
       need("settings.users");
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email || "")) throw new Error("Enter a valid email address.");
-      if (db.profiles.some((p) => norm(p.email) === norm(email))) throw new Error("That email already has an account. Change its role or access in the Users list instead.");
+      if (db.profiles.some((p) => !p.deleted_at && norm(p.email) === norm(email))) throw new Error("That email already has an account. Change its role or access in the Users list instead.");
       if (role === "admin" && profile().role !== "admin") throw new Error("Only an administrator can invite an administrator.");
       db.profiles.push({ id: uid(), email: email.trim().toLowerCase(), full_name: full_name || email.split("@")[0], role, is_active: true, invited_at: new Date().toISOString(), accepted_at: null });
+    }),
+    async userActivity(id) {
+      need("settings.users");
+      await wait();
+      const filed = db.requests.filter((r) => r.liaison_id === id);
+      const approved = db.requests.filter((r) => r.approved_by === id);
+      const recent = [...filed.map((r) => ({ ...r, rel: "filed" })), ...approved.map((r) => ({ ...r, rel: "approved" }))]
+        .sort((a, b) => (a.created_at > b.created_at ? -1 : 1))
+        .slice(0, 8)
+        .map((r) => ({ ref_no: r.ref_no, status: r.status, request_date: r.request_date, role: r.rel }));
+      return {
+        requests: filed.length,
+        requests_in_progress: filed.filter((r) => ["on_hold", "open", "disbursed", "paid"].includes(r.status)).length,
+        approvals: approved.length,
+        events: db.events.filter((e) => e.actor_id === id).length,
+        documents: 0, returns: 0, reclass: 0, devices: 0,
+        recent,
+      };
+    },
+    deleteUser: (id) => mutate(() => {
+      need("settings.users");
+      const u = db.profiles.find((x) => x.id === id);
+      if (!u) throw new Error("That user no longer exists.");
+      if (id === me.id) throw new Error("You can't delete your own account. Ask another administrator.");
+      if (u.role === "admin" && profile().role !== "admin") throw new Error("Only an administrator can delete an administrator.");
+      const kept = db.requests.some((r) => r.liaison_id === id || r.approved_by === id) || db.events.some((e) => e.actor_id === id);
+      if (kept) Object.assign(u, { is_active: false, deleted_at: new Date().toISOString(), deleted_by_name: myName() });
+      else db.profiles.splice(db.profiles.indexOf(u), 1);
+      return { ok: true, kept, email: u.email };
     }),
     saveRole: (r) => mutate(() => {
       need("settings.users");
@@ -1397,6 +1430,12 @@ function createSupabaseApi() {
       const client = await sb();
       await client.auth.signOut();
       userId = null;
+    },
+    // Forgot password: Supabase emails a link that returns to RESET_PATH. The answer is the same whether or not
+    // the address has an account, so the sign-in page gives nothing away.
+    async resetPassword(email, captchaToken) {
+      const client = await sb();
+      await ok(client.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin + RESET_PATH, ...(captchaToken ? { captchaToken } : {}) }));
     },
     async updatePassword(password) {
       const client = await sb();
@@ -1637,6 +1676,21 @@ function createSupabaseApi() {
     async saveProfile(p) {
       const c = await sb();
       await ok(c.from("oe_profiles").update({ full_name: p.full_name, role: p.role, is_active: p.is_active }).eq("id", p.id));
+    },
+    async userActivity(id) {
+      const c = await sb();
+      return ok(c.rpc("oe_user_activity", { p_id: id }));
+    },
+    async deleteUser(id) {
+      const c = await sb();
+      const { data, error } = await c.functions.invoke("oe-delete-user", { body: { id } });
+      if (error) {
+        let msg = error.message;
+        try { msg = (await error.context.json()).error || msg; } catch (e) { /* keep generic */ }
+        throw new Error(msg);
+      }
+      if (data && data.error) throw new Error(data.error);
+      return data;
     },
     async inviteUser(body) {
       const c = await sb();
@@ -2037,6 +2091,9 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-signin-mark rect{fill:var(--teal-50)}
 .oe-signin-mark g{fill:none;stroke:var(--teal-d);stroke-width:1.6}
 .oe-signin-foot{position:absolute;left:0;right:0;bottom:calc(26px + env(safe-area-inset-bottom,0px));display:flex;align-items:center;justify-content:center;gap:8px;color:rgba(214,242,238,.66);font-size:13px}
+.oe-label-row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.oe .oe-forgot{background:none;border:0;padding:4px 0;font:inherit;font-size:12.5px;font-weight:500;color:var(--blue);cursor:pointer;text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:1px}
+.oe .oe-forgot:hover{color:var(--ink)}
 .oe-pass{position:relative}.oe-pass .oe-input{padding-right:68px}
 .oe-invite-who{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--sunk)}
 .oe-pass button{position:absolute;right:5px;top:50%;transform:translateY(-50%);height:28px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:var(--teal-d);font-size:12.5px;font-weight:500;cursor:pointer}
@@ -8281,9 +8338,12 @@ function UsersAdmin() {
   const { data, me, api, run, ui } = useApp();
   const [inviting, setInviting] = useState(false);
   const [editing, setEditing] = useState(null);
+  const [deleting, setDeleting] = useState(null);
+  const [showFormer, setShowFormer] = useState(false); // deleted users whose profile stays for their records
   const [q, setQ] = useState("");
   const roles = [...data.roles].sort((a, b) => a.sort_order - b.sort_order);
-  const users = data.profiles.filter((u) => !q || norm(u.full_name).includes(norm(q)) || norm(u.email).includes(norm(q)));
+  const formerCount = data.profiles.filter((u) => u.deleted_at).length;
+  const users = data.profiles.filter((u) => (showFormer || !u.deleted_at) && (!q || norm(u.full_name).includes(norm(q)) || norm(u.email).includes(norm(q))));
   const save = (u, patch, msg) => run(() => api.saveProfile({ ...u, ...patch }), msg);
   const toggle = async (u) => {
     if (u.is_active) {
@@ -8297,6 +8357,11 @@ function UsersAdmin() {
     <div className="oe-stack">
       <Filters style={{ marginBottom: 0 }}>
         <SearchBox value={q} onChange={setQ} placeholder="Search name or email" />
+        {formerCount > 0 && (
+          <label className="oe-check small">
+            <input type="checkbox" checked={showFormer} onChange={(e) => setShowFormer(e.target.checked)} /> Show {formerCount} deleted {formerCount === 1 ? "user" : "users"}
+          </label>
+        )}
         <span style={{ flex: 1 }} />
         <Button variant="primary" icon="plus" onClick={() => setInviting(true)}>
           Invite user
@@ -8319,15 +8384,17 @@ function UsersAdmin() {
               const self = u.id === me.id;
               // only an administrator can give, change or remove administrator access (the database checks the same)
               const adminLocked = me.role !== "admin" && u.role === "admin";
+              const gone = !!u.deleted_at; // the sign-in is removed; the row stays because their name is on records
               return (
                 <tr key={u.id} className={u.is_active ? "" : "muted-row"}>
                   <td style={{ fontWeight: 500, color: "var(--ink)" }}>
                     {u.full_name || "—"}
                     {self && <span className="sub">You</span>}
+                    {gone && <span className="sub">Deleted {fmtDate(u.deleted_at)}{u.deleted_by_name ? ` by ${u.deleted_by_name}` : ""}</span>}
                   </td>
                   <td>{u.email}</td>
                   <td>
-                    <select className="oe-select" style={{ width: 200 }} value={u.role} disabled={self || adminLocked} title={self ? "Another administrator must change your role" : adminLocked ? "Only an administrator can change an administrator" : undefined} onChange={(e) => save(u, { role: e.target.value }, "Role updated")} aria-label={`Role for ${u.full_name}`}>
+                    <select className="oe-select" style={{ width: 200 }} value={u.role} disabled={self || adminLocked || gone} title={self ? "Another administrator must change your role" : adminLocked ? "Only an administrator can change an administrator" : undefined} onChange={(e) => save(u, { role: e.target.value }, "Role updated")} aria-label={`Role for ${u.full_name}`}>
                       {roles.map((r) => (
                         <option key={r.role} value={r.role} disabled={r.role === "admin" && me.role !== "admin"}>
                           {r.label}
@@ -8336,7 +8403,9 @@ function UsersAdmin() {
                     </select>
                   </td>
                   <td>
-                    {u.accepted_at ? (
+                    {gone ? (
+                      <span className="muted">—</span>
+                    ) : u.accepted_at ? (
                       <Chip tone="teal" className="status" title={`Password set ${fmtDateTime(u.accepted_at)}`}>Accepted</Chip>
                     ) : u.invited_at ? (
                       <Chip tone="amber" className="status" title={`Invited ${fmtDateTime(u.invited_at)}. Hasn't opened the link and set a password yet.`}>Pending</Chip>
@@ -8344,13 +8413,16 @@ function UsersAdmin() {
                       <span className="muted">—</span>
                     )}
                   </td>
-                  <td>{u.is_active ? <Chip tone="teal">Can sign in</Chip> : <Chip tone="amber">No access</Chip>}</td>
+                  <td>{gone ? <Chip tone="muted">Deleted</Chip> : u.is_active ? <Chip tone="teal">Can sign in</Chip> : <Chip tone="amber">No access</Chip>}</td>
                   <td className="r" style={{ whiteSpace: "nowrap" }}>
-                    <Button size="sm" variant="ghost" icon="edit" aria-label={`Rename ${u.full_name}`} onClick={() => setEditing(u)} />
-                    {!self && !adminLocked && (
-                      <Button size="sm" variant={u.is_active ? "danger" : "secondary"} onClick={() => toggle(u)}>
-                        {u.is_active ? "Remove access" : "Grant access"}
-                      </Button>
+                    {!gone && <Button size="sm" variant="ghost" icon="edit" aria-label={`Rename ${u.full_name}`} onClick={() => setEditing(u)} />}
+                    {!self && !adminLocked && !gone && (
+                      <>
+                        <Button size="sm" variant={u.is_active ? "danger" : "secondary"} onClick={() => toggle(u)}>
+                          {u.is_active ? "Remove access" : "Grant access"}
+                        </Button>{" "}
+                        <Button size="sm" variant="ghost" icon="trash" aria-label={`Delete ${u.full_name || u.email}`} title="Delete user" onClick={() => setDeleting(u)} />
+                      </>
                     )}
                   </td>
                 </tr>
@@ -8366,6 +8438,7 @@ function UsersAdmin() {
       </p>
       {inviting && <InviteForm roles={roles} onClose={() => setInviting(false)} />}
       {editing && <RenameUser user={editing} onClose={() => setEditing(null)} />}
+      {deleting && <DeleteUser user={deleting} onClose={() => setDeleting(null)} />}
     </div>
   );
 }
@@ -8417,6 +8490,114 @@ function InviteForm({ roles, onClose }) {
           </select>
         </Field>
       </div>
+    </Modal>
+  );
+}
+
+/** Delete a user: their sign-in goes; their records stay with their name on them, and the email can be invited again. */
+function DeleteUser({ user, onClose }) {
+  const { api, run } = useApp();
+  const [act, setAct] = useState(null); // null while loading
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    api
+      .userActivity(user.id)
+      .then((a) => alive && setAct(a || {}))
+      .catch((e) => alive && setErr((e && e.message) || "Their records could not be checked."));
+    return () => {
+      alive = false;
+    };
+  }, [api, user.id]);
+  const n = (k) => Number((act && act[k]) || 0);
+  const hasRecords = !!act && ["requests", "approvals", "events", "documents", "returns", "reclass"].some((k) => n(k) > 0);
+  const counts = [
+    ["Requests filed", n("requests")],
+    ["Of which still in progress", n("requests_in_progress")],
+    ["Requests approved", n("approvals")],
+    ["History entries", n("events")],
+    ["Documents uploaded", n("documents")],
+    ["Fund returns recorded", n("returns")],
+    ["Reclassifications", n("reclass")],
+  ].filter(([, v]) => v > 0);
+  const del = async () => {
+    setBusy(true);
+    const ok = await run(() => api.deleteUser(user.id), `${user.full_name || user.email} deleted. ${user.email} can be invited again.`);
+    setBusy(false);
+    if (ok) onClose();
+  };
+  return (
+    <Modal
+      title={`Delete ${user.full_name || user.email}?`}
+      subtitle={user.email}
+      onClose={onClose}
+      width={540}
+      footer={(close) => (
+        <>
+          <Button onClick={close}>Cancel</Button>
+          <Button variant="danger" className="solid" busy={busy} disabled={!act || !!err} onClick={del}>
+            {hasRecords ? "Delete user anyway" : "Delete user"}
+          </Button>
+        </>
+      )}
+    >
+      {err ? (
+        <Note tone="bad">{err}</Note>
+      ) : !act ? (
+        <p className="muted">Checking their records…</p>
+      ) : hasRecords ? (
+        <div className="oe-stack" style={{ gap: 12 }}>
+          <Note tone="warn" icon="alert">
+            This person has records in the system. The records stay, with their name on them; only their sign-in is removed.
+          </Note>
+          <dl className="oe-kv">
+            {counts.map(([k, v]) => (
+              <div key={k}>
+                <dt>{k}</dt>
+                <dd>{v}</dd>
+              </div>
+            ))}
+          </dl>
+          {act.recent && act.recent.length > 0 && (
+            <div className="oe-tablewrap">
+              <table className="oe-table tight">
+                <thead>
+                  <tr>
+                    <th>Request</th>
+                    <th>Date</th>
+                    <th>Status</th>
+                    <th>Their part</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {act.recent.map((r) => (
+                    <tr key={r.ref_no + r.role}>
+                      <td className="oe-code">{r.ref_no}</td>
+                      <td>{fmtDate(r.request_date)}</td>
+                      <td>
+                        <StatusChip status={r.status} />
+                      </td>
+                      <td>{r.role === "filed" ? "Filed it" : "Approved it"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {n("requests_in_progress") > 0 && (
+            <Note tone="warn">
+              {n("requests_in_progress")} of their requests {n("requests_in_progress") === 1 ? "is" : "are"} still in progress. They can no longer act on them, so someone else has to follow them up.
+            </Note>
+          )}
+          <p className="muted small">Afterwards the same email can be invited again as a new user. This can't be undone.</p>
+        </div>
+      ) : (
+        <div className="oe-stack" style={{ gap: 10 }}>
+          <p>They have no requests, approvals or other records, so they are removed completely.</p>
+          <p className="muted small">The same email can be invited again afterwards. This can't be undone.</p>
+        </div>
+      )}
     </Modal>
   );
 }
@@ -8881,6 +9062,42 @@ function Login({ api, onDone, onSwitchMode, demoOffered, notice }) {
   const captchaOn = !demo && Boolean(CONFIG.captchaSiteKey);
   const [captcha, setCaptcha] = useState(null);
   const [captchaReset, setCaptchaReset] = useState(0);
+  // "Forgot password?": ask for the email, send the reset link, and say so without confirming the account exists
+  const [forgot, setForgot] = useState(false);
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const openForgot = () => {
+    setForgot(true);
+    setSent(false);
+    setMsg(null);
+    setEmail(loginEmail(f.user) || "");
+  };
+  const closeForgot = () => {
+    setForgot(false);
+    setSent(false);
+    setMsg(null);
+  };
+  const sendReset = async (e) => {
+    if (e && e.preventDefault) e.preventDefault();
+    if (busy) return;
+    const em = email.trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) return setMsg({ tone: "warn", text: "Enter your full email address." });
+    if (captchaOn && !captcha) return setMsg({ tone: "warn", text: "Complete the verification first." });
+    setBusy(true);
+    setMsg(null);
+    try {
+      await api.resetPassword(em, captchaOn ? captcha : undefined);
+      setSent(true);
+    } catch (err) {
+      setMsg({ tone: "bad", text: /rate|second|too many/i.test(err.message) ? "A link was sent a moment ago. Wait a minute before asking again." : err.message });
+      if (captchaOn) {
+        setCaptcha(null);
+        setCaptchaReset((n) => n + 1);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
   const submit = async (e) => {
     if (e && e.preventDefault) e.preventDefault();
     if (busy) return;
@@ -8900,8 +9117,6 @@ function Login({ api, onDone, onSwitchMode, demoOffered, notice }) {
       setBusy(false);
     }
   };
-  // No self-service password reset: a forgotten password is changed by the administrator
-  // (Supabase SQL Editor: select oe_set_login_password('email', 'new password')).
   return (
     <SignInFrame>
         {demo ? (
@@ -8947,6 +9162,39 @@ function Login({ api, onDone, onSwitchMode, demoOffered, notice }) {
               </Button>
             )}
           </div>
+        ) : forgot ? (
+          <form className="oe-login-card" onSubmit={sendReset}>
+            <div>
+              <h2>Reset your password</h2>
+              <p className="muted" style={{ marginTop: 4 }}>
+                Enter the email address your administrator invited you with. We'll send a link to choose a new password.
+              </p>
+            </div>
+            {sent ? (
+              <>
+                <Note tone="info">
+                  If {email.trim()} has an account, a reset link is on its way. Check your inbox and spam folder. The link works once and expires after one hour.
+                </Note>
+                <Button variant="primary" onClick={closeForgot}>
+                  Back to sign in
+                </Button>
+              </>
+            ) : (
+              <>
+                <Field label="Email address">
+                  <input className="oe-input" type="email" autoComplete="email" inputMode="email" autoFocus value={email} onChange={(e) => setEmail(e.target.value)} />
+                </Field>
+                {captchaOn && <Captcha siteKey={CONFIG.captchaSiteKey} onToken={setCaptcha} resetKey={captchaReset} />}
+                {msg && <Note tone={msg.tone}>{msg.text}</Note>}
+                <Button type="submit" variant="primary" busy={busy} onClick={sendReset}>
+                  Send reset link
+                </Button>
+                <Button variant="ghost" disabled={busy} onClick={closeForgot}>
+                  Back to sign in
+                </Button>
+              </>
+            )}
+          </form>
         ) : (
           <form className="oe-login-card" onSubmit={submit}>
             <div>
@@ -8967,7 +9215,17 @@ function Login({ api, onDone, onSwitchMode, demoOffered, notice }) {
                 onChange={(e) => setF({ ...f, user: e.target.value })}
               />
             </Field>
-            <Field label="Password" as="div">
+            <Field
+              as="div"
+              label={
+                <span className="oe-label-row">
+                  Password
+                  <button type="button" className="oe-forgot" onClick={openForgot}>
+                    Forgot password?
+                  </button>
+                </span>
+              }
+            >
               <div className="oe-pass">
                 <input
                   className="oe-input"
@@ -9003,7 +9261,7 @@ function Login({ api, onDone, onSwitchMode, demoOffered, notice }) {
   );
 }
 
-function SetPassword({ api, onDone }) {
+function SetPassword({ api, onDone, mode = "invite" }) {
   const [a, setA] = useState("");
   const [b, setB] = useState("");
   const [show, setShow] = useState(false);
@@ -9047,9 +9305,11 @@ function SetPassword({ api, onDone }) {
     <SignInFrame>
         <form className="oe-login-card" onSubmit={submit}>
           <div>
-            <h2>Set your password</h2>
+            <h2>{mode === "reset" ? "Choose a new password" : "Set your password"}</h2>
             <p className="muted" style={{ marginTop: 4 }}>
-              You've been invited to this system. Choose a password, then sign in with it. Until you do, this is the only page you can open.
+              {mode === "reset"
+                ? "Enter a new password for your account, then sign in with it."
+                : "You've been invited to this system. Choose a password, then sign in with it. Until you do, this is the only page you can open."}
             </p>
           </div>
           {who && (
@@ -9080,7 +9340,7 @@ function SetPassword({ api, onDone }) {
           </Field>
           {err && <Note tone="bad">{err}</Note>}
           <Button type="submit" variant="primary" busy={busy} onClick={submit}>
-            Confirm password
+            {mode === "reset" ? "Save new password" : "Confirm password"}
           </Button>
         </form>
     </SignInFrame>
@@ -9413,7 +9673,11 @@ function Root() {
   // The invited person has confirmed a password: end the invite session and ask them to sign in with it.
   const passwordSet = useCallback(
     async (email) => {
-      const notice = { tone: "info", user: email || "", text: "Your password is saved. Sign in with your email and the password you just set." };
+      const notice = {
+        tone: "info",
+        user: email || "",
+        text: RESET_FLOW ? "Your password is changed. Sign in with your email and your new password." : "Your password is saved. Sign in with your email and the password you just set.",
+      };
       if (INVITE_TAB) {
         // end the in-memory invite session, then reload as the normal sign-in page (the administrator's session, if any, is untouched)
         try {
@@ -9439,10 +9703,14 @@ function Root() {
         if (LINK_ERROR && window.history && window.history.replaceState) window.history.replaceState(null, "", window.location.pathname + window.location.search);
         if (!user) {
           let notice = null;
-          if (LINK_ERROR)
+          if (LINK_ERROR && RESET_FLOW)
+            notice = { tone: "warn", text: /expired/i.test(LINK_ERROR) ? "That reset link was already used or has expired. Use Forgot password? to get a new one." : "That reset link could not be used. Use Forgot password? to get a new one." };
+          else if (LINK_ERROR)
             notice = { tone: "warn", text: /expired/i.test(LINK_ERROR) ? "That link was already used or has expired. Ask your administrator to send a new invite." : "That link could not be used. Ask your administrator to send a new invite." };
           else if (INITIAL_PATH === INVITE_PATH)
             notice = { tone: "info", text: "To set your password, open the link in your invitation email. Already set it? Sign in below." };
+          else if (INITIAL_PATH === RESET_PATH)
+            notice = { tone: "info", text: "To choose a new password, open the link in the reset email. Need a new link? Use Forgot password? below." };
           // the invite tab never shows the sign-in form itself: its session would not survive a reload
           if (INVITE_TAB) return handoffToSignIn(notice);
           if (notice) setLoginNotice(notice);
@@ -9565,7 +9833,7 @@ function Root() {
     if (!(window.history && window.history.replaceState) || auth.status === "loading") return;
     const how = addressMode.current;
     addressMode.current = "replace";
-    const want = auth.status === "set_password" ? INVITE_PATH : auth.status === "signed_out" ? SIGNIN_PATH : auth.status === "ready" ? pathOfPage(current) : null;
+    const want = auth.status === "set_password" ? (RESET_FLOW ? RESET_PATH : INVITE_PATH) : auth.status === "signed_out" ? SIGNIN_PATH : auth.status === "ready" ? pathOfPage(current) : null;
     if (!want || window.location.pathname === want) return;
     window.history[how === "push" ? "pushState" : "replaceState"](null, "", want + window.location.search);
   }, [auth.status, current, popTick]);
@@ -9598,7 +9866,7 @@ function Root() {
   }, [auth.status, api]);
 
   // the browser tab stays neutral until someone is signed in
-  const tabTitle = auth.status === "ready" ? `${actionCount ? `(${actionCount}) ` : ""}Project Expense Monitoring` : auth.status === "set_password" ? "Set your password" : "Sign in";
+  const tabTitle = auth.status === "ready" ? `${actionCount ? `(${actionCount}) ` : ""}Project Expense Monitoring` : auth.status === "set_password" ? (RESET_FLOW ? "Choose a new password" : "Set your password") : "Sign in";
   useEffect(() => {
     document.title = tabTitle;
   }, [tabTitle]);
@@ -9622,7 +9890,7 @@ function Root() {
       </div>
     );
   if (auth.status === "signed_out") return <Login key={loginNotice ? "after-invite" : "plain"} api={api} onDone={enter} onSwitchMode={LIVE ? switchMode : null} demoOffered={demoOffered} notice={loginNotice} />;
-  if (auth.status === "set_password") return <SetPassword api={api} onDone={passwordSet} />;
+  if (auth.status === "set_password") return <SetPassword api={api} onDone={passwordSet} mode={RESET_FLOW ? "reset" : "invite"} />;
   if (auth.status === "inactive")
     return (
       <div className="oe-center">
