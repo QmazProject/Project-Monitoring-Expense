@@ -9,6 +9,26 @@ import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, useR
 import { createClient } from "@supabase/supabase-js";
 // names this browser in oe_push_subscriptions, so one PC keeps one row however often its push address changes
 import { deviceId, endpointTail, pushSaveSteps } from "./push-device.js";
+// the order of the approvals queue: the requests waiting longest first, then the newest
+import { APPROVAL_AGING_DAYS, groupApprovalQueue } from "./approvals-queue.js";
+// the order of the modules in the side panel, as each person arranged them in this browser
+import { applyNavOrder, clearNavOrder, mergeNavOrder, moveInOrder, placeInOrder, readNavOrder, writeNavOrder } from "./nav-order.js";
+/* "Needs my action": the one rule, shared with the oe-push function so the number on a notification badge is
+   the number this app shows. Lives under supabase/functions/_shared because that is what the function bundles. */
+import {
+  RETURN_ROLES,
+  countNeedsAction,
+  lineApproved,
+  lineNet,
+  linePaid,
+  lineReturned,
+  lineWithLiaison,
+  liveLines,
+  makeCan,
+  reclassState,
+  requestStep,
+  round2,
+} from "../supabase/functions/_shared/next-step.js";
 
 /* ---------------------------------------------------------------------
    1. CONFIG
@@ -77,7 +97,7 @@ const LINK_ERROR = /(^#|&)error=/.test(INITIAL_HASH) ? ((INITIAL_HASH.match(/err
    2. CONSTANTS
    --------------------------------------------------------------------- */
 /** Only these roles may record a fund return, whatever the permission settings say (the database checks the same). */
-const RETURN_ROLES = ["admin", "tm", "accounting"];
+/* RETURN_ROLES is imported from the shared rule (see the top of this file). */
 
 const PERMISSIONS = [
   { key: "report.view", label: "Project report", group: "Monitoring" },
@@ -131,12 +151,16 @@ const DEFAULT_SETTINGS = {
   near_limit_pct: 90,
   idle_minutes: 30,
   form_title: "Special Request Payment Form",
+  // Approvals queue: on by default, so a request nobody has got to is lifted to the top of the queue instead
+  // of sinking under the ones filed today. Unticked in Settings, System, the queue is newest first only.
+  approvals_attention: true,
+  approvals_aging_days: APPROVAL_AGING_DAYS,
 };
 
 /* ---------------------------------------------------------------------
    3. UTILITIES
    --------------------------------------------------------------------- */
-const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+/* round2 is imported from the shared rule (see the top of this file). */
 const num = (v) => (v === "" || v == null || isNaN(Number(v)) ? null : Number(v));
 const norm = (s) => (s == null ? "" : String(s)).trim().toLowerCase();
 const uid = () =>
@@ -405,14 +429,8 @@ function aggregateUsage(requests) {
   return [...m.values()];
 }
 
-/* Money on a line once approved: paid to the client + returned + still with the liaison. */
-const lineApproved = (l) => Number(l.approved_amount ?? l.amount);
-const lineReturned = (l) => Number(l.returned_amount || 0);
-/** What counts in the project report: returned money doesn't. */
-const lineNet = (l) => round2(lineApproved(l) - lineReturned(l));
-const linePaid = (l) => (l.paid_amount != null ? Number(l.paid_amount) : ["paid", "closed"].includes(l.status) ? lineNet(l) : 0);
-/** Still in the liaison's hands (to give to the client, or to return). */
-const lineWithLiaison = (l) => (["disbursed", "part_paid"].includes(l.status) ? round2(lineNet(l) - linePaid(l)) : 0);
+/* lineApproved, lineReturned, lineNet, linePaid and lineWithLiaison now live beside the rule that uses them,
+   in supabase/functions/_shared/next-step.js, and are imported at the top of this file. */
 
 /** A request as it stood before an edit, kept on the "edited" history entry so approvers can see what changed
  *  (the database's oe_request_snapshot() builds the same shape). */
@@ -526,20 +544,12 @@ const reqTotal = (r) =>
     0
   );
 const reqRequested = (r) => r.lines.reduce((s, l) => s + Number(l.amount), 0);
-const liveLines = (r) => r.lines.filter((l) => !["declined", "rejected", "cancelled", "returned"].includes(l.status));
+/* liveLines is imported from the shared rule (see the top of this file). */
 
 /** What happens next, and whether the signed-in user is the one to do it. */
 /** For a request with lines filed under an internal project (FOR-ASSIGNMENT, ADVANCES):
     how much of those lines is still unassigned. Null when there are none. */
-function reclassState(r, idx) {
-  if (!idx) return null;
-  const lines = r.lines.filter((l) => ["disbursed", "part_paid", "paid", "closed"].includes(l.status) && (idx.projects.get(l.project_id) || {}).is_internal);
-  if (!lines.length) return null;
-  const total = lines.reduce((a, l) => a + lineNet(l), 0);
-  const assigned = lines.reduce((a, l) => a + (l.reclass || []).reduce((b, x) => b + Number(x.amount), 0), 0);
-  const remaining = round2(total - assigned);
-  return { total, assigned, remaining, hasSplit: assigned > 0.004, complete: remaining <= 0.004 };
-}
+/* reclassState is imported from the shared rule (see the top of this file). */
 
 /** Status shown to people: a closed request whose internal-project amount has been split reads "Reclassified". */
 function displayStatus(r, idx) {
@@ -586,52 +596,29 @@ function statusSince(r, shown) {
 const daysSince = (iso) => (iso ? Math.max(0, Math.round((Date.parse(todayISO() + "T00:00:00") - Date.parse(String(iso).slice(0, 10) + "T00:00:00")) / 86400000)) : null);
 const daysLabel = (n) => (n == null ? "" : n === 0 ? "today" : `${n} ${n === 1 ? "day" : "days"}`);
 
+/* The wording for each step. requestStep (the shared rule) decides which step a request is on and whether it
+   is waiting for this person; this turns that into the sentence shown in the list. The rule is shared with the
+   oe-push function so a badge that arrives with a notification matches what the app shows. */
+const STEP_TEXT = {
+  review: () => "Review for approval",
+  await_approval: () => "Waiting for approval",
+  erp: () => "Enter ERP reference",
+  await_disburse: () => "Waiting for disbursement",
+  pay: (m) => `Give fund to client (${m.paidish} of ${m.lineCount} paid)`,
+  return: (m) => `Record the return of ${compact(m.toReturn)}`,
+  verify: (m) => `Verify paid lines (${m.paidish} of ${m.lineCount} paid)`,
+  await_return: (m) => `Waiting for ${compact(m.toReturn)} to be returned`,
+  await_verify: (m) => (m.tmOnly ? "Waiting for top management verification" : "Waiting for verification"),
+  complete: () => "Complete",
+  reclass_done: () => "Complete reclassification",
+  reclass_todo: () => "For reclassification",
+  reclass_partial: (m) => `Partially reclassified (${compact(m.remaining)} remaining)`,
+  none: () => "No further action",
+};
+
 function nextStep(r, me, can, idx = null) {
-  const own = r.liaison_id === me.id;
-  const lines = liveLines(r);
-  const toPay = lines.filter((l) => l.status === "disbursed").length;
-  const paidish = lines.filter((l) => l.status === "paid" || l.status === "closed").length;
-  const needAcct = lines.some((l) => l.status === "paid" && !l.acct_verified_at);
-  const needTm = lines.some((l) => l.status === "paid" && !l.tm_verified_at);
-  // One verification (default): top management verifies, accounting is only the backup.
-  const tmOnly = !idx || idx.closePolicy !== "both";
-  const verifyMine = tmOnly ? can("requests.verify_tm") && needTm : (can("requests.verify_acct") && needAcct) || (can("requests.verify_tm") && needTm);
-  const waitText = tmOnly ? "Waiting for top management verification" : "Waiting for verification";
-  switch (r.status) {
-    case "on_hold": {
-      // approvers can't approve their own request, except administrators
-      const mine = can("requests.approve") && (!own || me.role === "admin");
-      return { text: mine ? "Review for approval" : "Waiting for approval", mine };
-    }
-    case "open":
-      if (!r.erp_ref) return { text: "Enter ERP reference", mine: can("requests.erp_ref") && own };
-      return { text: "Waiting for disbursement", mine: can("requests.disburse") };
-    case "disbursed": {
-      const payMine = can("requests.pay") && own && toPay > 0;
-      const progress = `(${paidish} of ${lines.length} paid)`;
-      // partly paid lines: the rest must come back to accounting
-      const toReturn = round2(lines.filter((l) => l.status === "part_paid").reduce((a, l) => a + lineWithLiaison(l), 0));
-      const returnMine = toReturn > 0 && can("requests.return") && RETURN_ROLES.includes(me.role) && (!own || me.role === "admin");
-      if (payMine) return { text: `Give fund to client ${progress}`, mine: true };
-      if (returnMine) return { text: `Record the return of ${compact(toReturn)}`, mine: true };
-      if (verifyMine) return { text: `Verify paid lines ${progress}`, mine: true };
-      if (toPay) return { text: `Give fund to client ${progress}`, mine: false };
-      if (toReturn > 0) return { text: `Waiting for ${compact(toReturn)} to be returned`, mine: false };
-      return { text: waitText, mine: false };
-    }
-    case "paid":
-      return { text: waitText, mine: verifyMine };
-    case "closed": {
-      const st = reclassState(r, idx);
-      if (!st) return { text: "Complete", mine: false };
-      if (st.complete) return { text: "Complete reclassification", mine: false };
-      const mine = can("requests.reclassify");
-      if (!st.hasSplit) return { text: "For reclassification", mine };
-      return { text: `Partially reclassified (${compact(st.remaining)} remaining)`, mine };
-    }
-    default:
-      return { text: "No further action", mine: false };
-  }
+  const { step, mine, meta } = requestStep(r, me, can, idx);
+  return { text: (STEP_TEXT[step] || STEP_TEXT.none)(meta), mine };
 }
 
 /* ---------------------------------------------------------------------
@@ -1792,6 +1779,16 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-nav button:hover{background:rgba(255,255,255,.08);color:#fff}
 .oe-nav button[aria-current=page]{background:rgba(255,255,255,.15);color:#fff;font-weight:500;box-shadow:inset 3px 0 0 #a6dcd4}
 .oe-nav .badge{margin-left:auto;background:#fff;color:var(--navy);font-size:11px;font-weight:600;border-radius:999px;padding:0 7px;min-width:20px;text-align:center;line-height:19px}
+/* for screen readers only: how to move a module, without putting it on the screen */
+.oe-sr{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}
+/* arranging the side panel: the module being dragged, and the right-click menu */
+.oe-nav.dragging{touch-action:none}
+.oe-nav button.drag{background:rgba(255,255,255,.2);color:#fff;box-shadow:0 10px 24px rgba(0,0,0,.35);position:relative;z-index:1}
+.oe-ctx{position:fixed;z-index:70;min-width:188px;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:var(--r-sm);box-shadow:0 14px 36px rgba(0,30,45,.22);padding:5px;display:flex;flex-direction:column;gap:1px}
+.oe-ctx button{display:flex;align-items:center;gap:9px;width:100%;border:0;background:transparent;color:inherit;font:inherit;font-size:13.5px;text-align:left;padding:8px 10px;border-radius:6px;cursor:pointer}
+.oe-ctx button:hover:not(:disabled){background:var(--hover)}
+.oe-ctx button:disabled{color:var(--faint);cursor:default}
+.oe-ctx p{margin:4px 10px 5px;color:var(--muted);font-size:11.5px;line-height:1.45;max-width:190px}
 .oe-me{border-top:1px solid rgba(255,255,255,.15);padding:14px 10px 0;font-size:13px}
 .oe-me b{display:block;font-weight:500;color:#fff}.oe-me small{display:block;color:rgba(255,255,255,.64);font-size:12px}
 .oe-me button{margin-top:10px;display:inline-flex;align-items:center;gap:7px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:#fff;border-radius:7px;padding:5px 10px;cursor:pointer;font-size:12.5px}
@@ -1965,6 +1962,10 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-split{display:grid;grid-template-columns:290px minmax(0,1fr);gap:18px;align-items:start}
 .oe-split>*{min-width:0}
 .oe-queue{display:flex;flex-direction:column;gap:8px;position:sticky;top:16px;max-height:calc(100vh - 120px);overflow:auto;padding:2px}
+/* group labels in the approvals queue ("Needs attention", "New requests") */
+.oe-qgroup{margin:6px 2px 0;font-size:12px;font-weight:500;text-transform:uppercase;letter-spacing:.06em;color:var(--faint)}
+.oe-qgroup:first-child{margin-top:0}
+.oe-qgroup.warn{color:var(--amber)}
 .oe-qitem{text-align:left;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;cursor:pointer;display:grid;gap:4px;width:100%}
 .oe-qitem:hover{border-color:var(--line-2)}.oe-qitem[aria-current=true]{border-color:var(--teal);box-shadow:0 0 0 1px var(--teal)}
 .oe-qitem .row{display:flex;justify-content:space-between;gap:8px;align-items:center}
@@ -2111,7 +2112,10 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-lgrid>.oe-lf:nth-last-child(2)>*{grid-column:span 2}
 .oe-lsub{margin-left:36px}
 }
-.oe-total{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:14px 18px;position:sticky;bottom:calc(12px + env(safe-area-inset-bottom,0px));box-shadow:0 8px 24px rgba(0,30,45,.08)}
+/* New request on phones: the request total and the submit button. Deliberately part of the page, not a
+   floating bar — it sits at the end of the form and scrolls with it, the same on iPhone and Android.
+   The page's own bottom padding (.oe-page) keeps it clear of the iPhone home indicator. */
+.oe-total{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:14px 18px}
 .oe-total b{font-size:20px;color:var(--ink);font-variant-numeric:tabular-nums}
 .oe-timeline{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}
 .oe-timeline li{display:grid;grid-template-columns:14px 1fr;gap:12px;padding-bottom:14px;position:relative}
@@ -2147,7 +2151,10 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-demo-users{display:grid;gap:8px}
 .oe-demo-users button{display:flex;justify-content:space-between;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;cursor:pointer;text-align:left}
 .oe-demo-users button:hover{border-color:var(--teal)}
-.oe-center{min-height:100vh;display:grid;place-items:center;padding:24px;text-align:center}
+/* Full-screen states with no top bar (offline, account waiting for access, no sections). These fill the
+   screen, so on an iPhone in standalone mode the padding has to clear the status bar and the home
+   indicator; where the insets are zero (Android, desktop) it stays the plain 24px. */
+.oe-center{min-height:100vh;display:grid;place-items:center;padding:max(24px,env(safe-area-inset-top,0px)) max(24px,env(safe-area-inset-right,0px)) max(24px,env(safe-area-inset-bottom,0px)) max(24px,env(safe-area-inset-left,0px));text-align:center}
 .oe-scrim{display:none}
 .oe-matrix td.c,.oe-matrix th.c{text-align:center}
 .oe-print-preview{border:1px solid var(--line);border-radius:8px;padding:28px;background:#fff;overflow:auto}
@@ -2172,7 +2179,12 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-side.open{transform:none}
 .oe-side-toggle{display:none}
 .oe-scrim{display:block;position:fixed;inset:0;background:rgba(0,20,30,.4);z-index:55}
-.oe-topbar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--navy);color:#fff;position:sticky;top:env(safe-area-inset-top,0px);z-index:40}
+/* The bar paints the status bar area itself, as padding rather than as an offset. index.html asks for the
+   full screen (viewport-fit=cover, apple-mobile-web-app-status-bar-style=black-translucent), so the page
+   starts behind the iPhone status bar; offsetting the bar by the inset left the page background showing
+   through above it as a pale strip. Filling it keeps the app navy to the very top edge and makes an iPhone
+   added to the Home Screen look like Android, where the insets are zero and nothing changes. */
+.oe-topbar{display:flex;align-items:center;gap:10px;padding:calc(10px + env(safe-area-inset-top,0px)) max(14px,env(safe-area-inset-right,0px)) 10px max(14px,env(safe-area-inset-left,0px));background:var(--navy);color:#fff;position:sticky;top:0;z-index:40}
 .oe-topbar button{background:transparent;border:0;color:#fff;display:grid;place-items:center;width:36px;height:36px;border-radius:8px;cursor:pointer}
 .oe-page{padding:20px 16px 48px}.oe-demo{padding:8px 16px}
 .oe-signin{grid-template-columns:minmax(0,1fr);justify-items:center;align-content:center;gap:22px;padding:28px 16px calc(24px + env(safe-area-inset-bottom,0px))}.oe-signin-card{grid-column:1;width:100%;max-width:440px;padding:28px 22px 24px}.oe-signin-foot{position:static}
@@ -2239,10 +2251,13 @@ font-family:Poppins,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 .oe-table.cards .oe-usage{min-width:0}
 .oe-table.cards .oe-clip{max-width:none;white-space:normal}
 .oe-table.cards td .oe-input{max-width:220px}
-/* approvals: approve and reject stay in reach; new request: labelled line fields and a bottom bar */
-.oe-approve-bar{position:sticky;bottom:0;z-index:3;background:var(--surface);margin:0 -18px -16px;padding:10px 18px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line)}
+/* approvals on phones: Reject and Approve close the review instead of floating over it, the same as the submit
+   button on a new request. They are the last thing in the drawer, which scrolls, and the drawer's own padding
+   already clears the iPhone home indicator (.oe-drawer), so the band does not add that space again. */
+.oe-approve-bar{background:var(--surface);margin:0 -18px -16px;padding:12px 18px;border-top:1px solid var(--line)}
 .oe-approve-bar .oe-btn{flex:1 1 auto}
-.oe-approve-float{display:flex;gap:8px;margin:0 -16px -32px;padding:10px 16px calc(10px + env(safe-area-inset-bottom,0px))}
+.oe-approve-float{display:flex;gap:8px;margin:0 -16px;padding:14px 16px}
+/* new request: labelled line fields and a bottom bar */
 .oe-lgrid{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px 8px}
 .oe-lgrid>.oe-line-no{grid-column:1;grid-row:1}
 .oe-lgrid>.oe-lrow-act{grid-column:2;grid-row:1;justify-content:flex-end}
@@ -5567,7 +5582,7 @@ function NewRequestPage({ params }) {
             </Button>
           </div>
         </div>
-        {/* phones: the total and the submit button stay in reach at the bottom of a long form */}
+        {/* phones: the total and the submit button close the form (the header carries them on wider screens) */}
         <div className="oe-total oe-phone-only">
           <span>
             <span className="muted small" style={{ display: "block" }}>Request total</span>
@@ -5577,7 +5592,6 @@ function NewRequestPage({ params }) {
             {editing ? "Save changes" : "Submit request"}
           </Button>
         </div>
-
       </div>
     </div>
   );
@@ -6030,7 +6044,18 @@ function RequestLineRow({ line: l, index, check, showLimits, errors, cats, onCha
    --------------------------------------------------------------------- */
 function ApprovalsPage({ params }) {
   const { data, idx, me, settings } = useApp();
-  const queue = useMemo(() => data.requests.filter((r) => r.status === "on_hold").sort((a, b) => (a.created_at > b.created_at ? 1 : -1)), [data.requests]);
+  // Settings, System decides whether the queue lifts the long-waiting requests to the top (on by default) and
+  // from how many days. Off, attentionAt is Infinity: nothing reaches it, so the queue is newest first with no
+  // headings and no waiting labels -- the plain list it was before.
+  const grouping = settings.approvals_attention !== false;
+  const attentionAt = grouping ? Math.min(60, Math.max(1, Number(settings.approvals_aging_days) || APPROVAL_AGING_DAYS)) : Infinity;
+  // Which requests are in the queue is unchanged: the ones waiting for approval. groupApprovalQueue
+  // (src/approvals-queue.js) only decides the order, using the same "waiting since" the rest of the app uses
+  // for an on-hold request, which is the day it was filed.
+  const { queue, aging, waitDays } = useMemo(
+    () => groupApprovalQueue(data.requests.filter((r) => r.status === "on_hold"), (r) => daysSince(statusSince(r, "on_hold")), attentionAt),
+    [data.requests, attentionAt]
+  );
   const [selId, setSelId] = useState((params && params.requestId) || null);
   // phones: the queue alone, and a tap opens the request in a full-screen drawer (nothing is picked by default,
   // and once a request is approved or rejected the drawer closes); desktops keep the queue beside the request
@@ -6045,41 +6070,70 @@ function ApprovalsPage({ params }) {
     return m;
   }, [queue, idx, settings]);
 
+  // One queue entry, used by both groups. How long it has been waiting is shown only once it reaches the
+  // threshold: on a request filed today the date beside the liaison's name already says so.
+  const queueItem = (r) => {
+    const waited = waitDays.get(r.id) || 0;
+    const late = waited >= attentionAt;
+    return (
+      <button key={r.id} className="oe-qitem" aria-current={sel && sel.id === r.id} aria-haspopup={phone ? "dialog" : undefined} onClick={() => setSelId(r.id)}>
+        <div className="row">
+          <span className="oe-code">{r.ref_no}</span>
+          <b className="num" style={{ color: "var(--ink)" }}>
+            {compact(reqRequested(r))}
+          </b>
+        </div>
+        {phone && <span className="oe-qopen">Tap to review</span>}
+        <div className="row muted small">
+          <span>
+            {r.liaison_name}, {fmtDate(r.request_date)}
+          </span>
+          <span>
+            {r.lines.length} {r.lines.length === 1 ? "line" : "lines"}
+          </span>
+        </div>
+        {(late || flags.get(r.id) > 0 || r.liaison_id === me.id) && (
+          <div className="oe-actions">
+            {late && <Chip tone="amber">{daysLabel(waited)} waiting</Chip>}
+            {flags.get(r.id) > 0 && <Chip tone="red">{flags.get(r.id)} over limit</Chip>}
+            {r.liaison_id === me.id && <Chip tone="muted">{me.role === "admin" ? "Filed by you" : "Filed by you, needs another approver"}</Chip>}
+          </div>
+        )}
+      </button>
+    );
+  };
+
   return (
     <div className="oe-page">
-      <PageHead title="Approvals" desc="Requests for approval, oldest first. Check each line against its project allocation, adjust amounts if needed, then approve or reject." />
+      <PageHead
+        title="Approvals"
+        desc={
+          grouping
+            ? `Requests for approval: anything waiting ${attentionAt} ${attentionAt === 1 ? "day" : "days"} or more comes first, then the newest. Check each line against its project allocation, adjust amounts if needed, then approve or reject.`
+            : "Requests for approval, newest first. Check each line against its project allocation, adjust amounts if needed, then approve or reject."
+        }
+      />
       {queue.length === 0 ? (
         <div className="oe-panel">
           <Empty title="Nothing waiting for approval" body="New requests from liaisons will appear here." />
         </div>
       ) : (
         <div className="oe-split">
+          {/* One list: the waiting-longest group, then the rest. A group's label is shown only when it has
+              requests in it, so a quiet day reads as a plain list of new requests. */}
           <nav className="oe-queue" aria-label="Requests waiting for approval">
-            {queue.map((r) => (
-              <button key={r.id} className="oe-qitem" aria-current={sel && sel.id === r.id} aria-haspopup={phone ? "dialog" : undefined} onClick={() => setSelId(r.id)}>
-                <div className="row">
-                  <span className="oe-code">{r.ref_no}</span>
-                  <b className="num" style={{ color: "var(--ink)" }}>
-                    {compact(reqRequested(r))}
-                  </b>
-                </div>
-                {phone && <span className="oe-qopen">Tap to review</span>}
-                <div className="row muted small">
-                  <span>
-                    {r.liaison_name}, {fmtDate(r.request_date)}
-                  </span>
-                  <span>
-                    {r.lines.length} {r.lines.length === 1 ? "line" : "lines"}
-                  </span>
-                </div>
-                {(flags.get(r.id) > 0 || r.liaison_id === me.id) && (
-                  <div className="oe-actions">
-                    {flags.get(r.id) > 0 && <Chip tone="red">{flags.get(r.id)} over limit</Chip>}
-                    {r.liaison_id === me.id && <Chip tone="muted">{me.role === "admin" ? "Filed by you" : "Filed by you, needs another approver"}</Chip>}
-                  </div>
-                )}
-              </button>
-            ))}
+            {grouping && aging > 0 && (
+              <p className="oe-qgroup warn" role="heading" aria-level="3">
+                Needs attention
+              </p>
+            )}
+            {queue.slice(0, aging).map(queueItem)}
+            {grouping && queue.length > aging && (
+              <p className="oe-qgroup" role="heading" aria-level="3">
+                New requests
+              </p>
+            )}
+            {queue.slice(aging).map(queueItem)}
           </nav>
           {sel && !phone && <ApprovalDetail key={sel.id} request={sel} />}
         </div>
@@ -6483,7 +6537,16 @@ function RequestsPage({ params }) {
   const [allCards, setAllCards] = useState(false);
   const cards = phone && !allCards ? KPI_CARDS.filter((c) => c.id === "action" || c.id === "all" || c.id === status) : KPI_CARDS;
 
-  const enriched = useMemo(() => data.requests.map((r) => ({ r, step: nextStep(r, me, can, idx), shown: displayStatus(r, idx) })), [data.requests, me, can, idx]);
+  // Newest first, so a request just filed is on the first page. api.loadAll already returns them in that
+  // order; sorted again here so this list keeps it whatever the data layer does later. The reference number
+  // breaks a tie between requests filed in the same second.
+  const enriched = useMemo(
+    () =>
+      data.requests
+        .map((r) => ({ r, step: nextStep(r, me, can, idx), shown: displayStatus(r, idx) }))
+        .sort((a, b) => String(b.r.created_at).localeCompare(String(a.r.created_at)) || String(b.r.ref_no).localeCompare(String(a.r.ref_no))),
+    [data.requests, me, can, idx]
+  );
   const matchesFilters = useCallback(
     ({ r }, ignoreRequester = false) => {
       const q = norm(f.q);
@@ -9008,6 +9071,8 @@ function SystemSettings() {
           near_limit_pct: Math.min(100, Math.max(1, Number(f.near_limit_pct) || 90)),
           idle_minutes: Math.max(0, Number(f.idle_minutes) || 0),
           demo_enabled: f.demo_enabled !== false,
+          approvals_attention: f.approvals_attention !== false,
+          approvals_aging_days: Math.min(60, Math.max(1, Number(f.approvals_aging_days) || APPROVAL_AGING_DAYS)),
         }),
       "System settings saved"
     );
@@ -9032,6 +9097,28 @@ function SystemSettings() {
               <input type="radio" name="oe-close" checked={f.close_policy === "both"} onChange={() => setF({ ...f, close_policy: "both" })} /> Both accounting and top management must verify
             </label>
           </Field>
+          <div className="oe-sect">Approvals queue</div>
+          <Field
+            as="div"
+            span={12}
+            hint="Ticked, the queue puts anything that has been waiting a while at the top, under a Needs attention heading, so it is not pushed out of sight by the requests filed today. Unticked, the queue is simply newest first."
+          >
+            <label className="oe-check">
+              <input
+                name="approvals_attention"
+                type="checkbox"
+                checked={f.approvals_attention !== false}
+                onChange={(e) => setF({ ...f, approvals_attention: e.target.checked })}
+              />{" "}
+              Show the requests waiting longest first
+            </label>
+          </Field>
+          {f.approvals_attention !== false && (
+            <Field label="Waiting days before a request needs attention" span={4} hint="Whole days since the request was filed. 1 to 60.">
+              <input name="approvals_aging_days" className="oe-input num" inputMode="numeric" value={f.approvals_aging_days ?? APPROVAL_AGING_DAYS} onChange={set("approvals_aging_days")} />
+            </Field>
+          )}
+          <div className="span-8" />
           <div className="oe-sect">Limits and security</div>
           <Field label="Near-limit warning at (%)" span={4} hint="Lines at or above this share of the allocation show a warning">
             <input name="near_limit_pct" className="oe-input num" inputMode="numeric" value={f.near_limit_pct} onChange={set("near_limit_pct")} />
@@ -9815,31 +9902,7 @@ function usePush(api, ready, approver) {
   }, []);
   const iosNeedsInstall = IS_IOS && !STANDALONE && !PUSH_SUPPORTED && api.mode === "live" && !!CONFIG.vapidPublicKey;
   const show = ready && !later && (offered ? perm === "default" || perm === "denied" : iosNeedsInstall);
-  // "Test notifications" in the side panel: checks this device end to end (asks first if it was never allowed)
-  const test = useCallback(async () => {
-    if (Notification.permission !== "granted") return enable();
-    setBusy(true);
-    try {
-      await sendTest("A test notification is on its way to this device.");
-    } catch (e) {
-      ui.err((e && e.message) || "The test notification could not be sent.");
-    } finally {
-      setBusy(false);
-    }
-  }, [enable, sendTest, ui]);
-  return { show, perm, busy, quiet, offered, enable, test, notNow, iosNeedsInstall, approver };
-}
-/** Demo only: shows a sample notification on this device (there is no server in the demo to send a real one). */
-async function demoNotification(ui) {
-  if (!("Notification" in window)) return ui.err("This browser does not support notifications.");
-  const p = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
-  if (p !== "granted") return ui.err("Notifications are blocked for this site. Allow them in the browser's site settings, then try again.");
-  // no page address: tapping it only brings the demo back to the front (opening a page would restart the demo)
-  const opts = { body: "REQ-2026-0007 from Mae, \u20B178,000.00 (demo sample)", icon: "/icons/icon-192.png", badge: "/icons/badge-96.png", tag: "oe-demo" };
-  const reg = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration() : null;
-  if (reg) await reg.showNotification("Request for approval", opts);
-  else new Notification("Request for approval", opts);
-  ui.ok("A sample notification was shown on this device. On the live system, approvers get these when a request is filed.");
+  return { show, perm, busy, quiet, offered, enable, notNow, iosNeedsInstall, approver };
 }
 function PushCard({ push }) {
   if (!push.show) return null;
@@ -10112,8 +10175,8 @@ function Root() {
 
   const me = (data && profile && data.profiles.find((p) => p.id === profile.id)) || profile;
   const roleRow = data && me ? data.roles.find((r) => r.role === me.role) : null;
-  const permSet = useMemo(() => new Set(me && me.role === "admin" ? ALL_PERMS : (roleRow && roleRow.permissions) || []), [me && me.role, roleRow]); // eslint-disable-line react-hooks/exhaustive-deps
-  const can = useCallback((p) => permSet.has(p), [permSet]);
+  // one definition of who may do what, shared with the oe-push function (administrators have every permission)
+  const can = useMemo(() => makeCan(me && me.role, roleRow && roleRow.permissions), [me && me.role, roleRow]); // eslint-disable-line react-hooks/exhaustive-deps
   const idx = useMemo(() => (data ? buildIndex(data) : null), [data]);
 
   const run = useCallback(
@@ -10152,7 +10215,101 @@ function Root() {
   }, []);
 
   const visible = NAV.filter((n) => n.perms.some(can));
+  // Which page opens when none is named stays as it was: the first module this role may open, in NAV order.
+  // Arranging the panel moves the buttons about, it does not change where signing in lands you.
   const current = visible.find((n) => n.id === page) ? page : visible[0] && visible[0].id;
+
+  /* The panel's own arrangement, kept in this browser (src/nav-order.js). A right-click offers Move up and
+     Move down on a computer; a press and hold drags on a touch screen. Only the order of the buttons changes:
+     the modules themselves, and who may open them, are untouched. */
+  const [navOrder, setNavOrder] = useState(() => readNavOrder());
+  const ordered = useMemo(() => applyNavOrder(visible, navOrder), [visible, navOrder]);
+  const [navMenu, setNavMenu] = useState(null); // right-click: { id, x, y }
+  const [dragId, setDragId] = useState(null); // the module being dragged on a touch screen
+  const navRef = useRef(null);
+  const press = useRef({ timer: null, id: null, y: 0, moved: false, dragged: false });
+
+  // Saves the arrangement, keeping any ids in storage that this role cannot see (two people, one browser).
+  const saveOrder = useCallback((ids) => {
+    setNavOrder(ids);
+    writeNavOrder(undefined, mergeNavOrder(ids, readNavOrder()));
+  }, []);
+  const moveModule = useCallback(
+    (id, delta) => saveOrder(moveInOrder(ordered.map((n) => n.id), id, delta)),
+    [ordered, saveOrder]
+  );
+  const resetOrder = useCallback(() => {
+    clearNavOrder();
+    setNavOrder([]);
+    setNavMenu(null);
+  }, []);
+
+  // The right-click menu closes on Escape, on a click elsewhere, and when the panel scrolls under it.
+  useEffect(() => {
+    if (!navMenu) return;
+    const close = () => setNavMenu(null);
+    const onKey = (e) => e.key === "Escape" && close();
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [navMenu]);
+
+  // Press and hold to pick a module up, then drag it past its neighbours. Mice keep the right-click menu, so
+  // holding a mouse button down does nothing. A hold that turns into a scroll is not a drag.
+  const HOLD_MS = 450;
+  const endPress = useCallback(() => {
+    clearTimeout(press.current.timer);
+    press.current.timer = null;
+    press.current.id = null;
+    setDragId(null);
+  }, []);
+  const onNavPointerDown = (e, id) => {
+    if (e.pointerType === "mouse") return;
+    press.current = { ...press.current, id, y: e.clientY, moved: false, dragged: false };
+    const el = e.currentTarget;
+    press.current.timer = setTimeout(() => {
+      if (press.current.moved) return;
+      press.current.dragged = true;
+      setDragId(id);
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch (err) {
+        /* capture is a nicety: the move handler works without it */
+      }
+    }, HOLD_MS);
+  };
+  const onNavPointerMove = (e) => {
+    if (!press.current.id) return;
+    if (!press.current.dragged) {
+      if (Math.abs(e.clientY - press.current.y) > 10) {
+        press.current.moved = true; // a scroll, not a hold
+        clearTimeout(press.current.timer);
+      }
+      return;
+    }
+    e.preventDefault();
+    const els = navRef.current ? [...navRef.current.querySelectorAll("button[data-nav]")] : [];
+    const over = els.findIndex((el) => {
+      const b = el.getBoundingClientRect();
+      return e.clientY >= b.top && e.clientY <= b.bottom;
+    });
+    if (over < 0) return;
+    const ids = ordered.map((n) => n.id);
+    if (ids[over] === press.current.id) return;
+    saveOrder(placeInOrder(ids, press.current.id, over));
+  };
+  const onNavPointerUp = () => {
+    const dragged = press.current.dragged;
+    endPress();
+    return dragged; // the click handler skips navigating when the press was a drag
+  };
 
   const badges = useMemo(() => {
     if (!data || !me) return {};
@@ -10283,20 +10440,64 @@ function Root() {
             <b className="full">Project Expense Monitoring</b>
             <b className="short" aria-hidden="true">PEM</b>
           </div>
-          <nav className="oe-nav" aria-label="Main">
-            {visible.map((n) => (
+          <nav className={`oe-nav ${dragId ? "dragging" : ""}`} aria-label="Main" ref={navRef}>
+            {ordered.map((n, i) => (
               <button
                 key={n.id}
+                data-nav={n.id}
+                className={dragId === n.id ? "drag" : undefined}
                 aria-current={current === n.id ? "page" : undefined}
                 title={collapsed ? (badges[n.id] > 0 ? `${n.label} (${badges[n.id]})` : n.label) : undefined}
-                onClick={async () => (n.id === current && !params ? setNavOpen(false) : (await confirmLeave()) && go(n.id))}
+                onClick={async () => {
+                  if (onNavPointerUp()) return; // the press was a drag, not a tap
+                  if (n.id === current && !params) return setNavOpen(false);
+                  if (await confirmLeave()) go(n.id);
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setNavMenu({ id: n.id, x: e.clientX, y: e.clientY });
+                }}
+                onKeyDown={(e) => {
+                  // the keyboard way to do what the right-click menu offers
+                  if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+                  e.preventDefault();
+                  moveModule(n.id, e.key === "ArrowUp" ? -1 : 1);
+                }}
+                onPointerDown={(e) => onNavPointerDown(e, n.id)}
+                onPointerMove={onNavPointerMove}
+                onPointerUp={onNavPointerUp}
+                onPointerCancel={endPress}
+                onLostPointerCapture={endPress}
               >
                 <Icon name={n.icon} />
                 <span className="lbl">{n.label}</span>
                 {badges[n.id] > 0 && <span className="badge">{badges[n.id]}</span>}
+                <span className="oe-sr">
+                  , module {i + 1} of {ordered.length}. Alt with up or down arrow moves it.
+                </span>
               </button>
             ))}
           </nav>
+          {navMenu && (
+            <div
+              className="oe-ctx"
+              role="menu"
+              aria-label="Arrange modules"
+              style={{ left: Math.min(navMenu.x, (typeof window !== "undefined" ? window.innerWidth : 400) - 196), top: Math.min(navMenu.y, (typeof window !== "undefined" ? window.innerHeight : 600) - 136) }}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <button role="menuitem" disabled={ordered.findIndex((n) => n.id === navMenu.id) === 0} onClick={() => moveModule(navMenu.id, -1)}>
+                <Icon name="up" size={14} /> Move up
+              </button>
+              <button role="menuitem" disabled={ordered.findIndex((n) => n.id === navMenu.id) === ordered.length - 1} onClick={() => moveModule(navMenu.id, 1)}>
+                <Icon name="down" size={14} /> Move down
+              </button>
+              <button role="menuitem" onClick={resetOrder}>
+                Reset to the usual order
+              </button>
+              <p>Alt with the up or down arrow does the same. On a phone, press and hold a module to drag it.</p>
+            </div>
+          )}
           <div className="oe-me">
             <b>{me.full_name || me.email}</b>
             <small>{roleRow ? roleRow.label : me.role}</small>
@@ -10304,16 +10505,8 @@ function Root() {
               <button onClick={async () => (await confirmLeave()) && signOut()} title={collapsed ? "Sign out" : undefined} aria-label="Sign out">
                 <Icon name="logout" size={14} /> <span className="lbl">Sign out</span>
               </button>
-              {api.mode === "demo" && typeof window !== "undefined" && "Notification" in window && (
-                <button onClick={() => demoNotification(ui).catch((e) => ui.err((e && e.message) || "The sample notification could not be shown."))} title={collapsed ? "Test notifications" : undefined} aria-label="Test notifications">
-                  <Icon name="bell" size={14} /> <span className="lbl">Test notifications</span>
-                </button>
-              )}
-              {push.offered && (
-                <button onClick={push.test} disabled={push.busy} title={collapsed ? "Test notifications" : undefined} aria-label="Test notifications">
-                  <Icon name="bell" size={14} /> <span className="lbl">{push.busy ? "Testing…" : "Test notifications"}</span>
-                </button>
-              )}
+              {/* No "Test notifications" button: turning notifications on already sends one to the device that
+                  asked, and reports what its push service answered, so there is nothing left to try by hand. */}
               {/* phones and tablets only: desktop browsers already offer install in the address bar */}
               {canInstall && !desktop && (
                 <button onClick={install} title={collapsed ? "Install app" : undefined} aria-label="Install app">

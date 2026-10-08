@@ -14,6 +14,9 @@
     "icons": "node scripts/make-icons.mjs",
     "push:keys": "node scripts/make-vapid-keys.mjs",
     "push:selftest": "node scripts/push-selftest.mjs",
+    "approvals:selftest": "node scripts/approvals-selftest.mjs",
+    "nav:selftest": "node scripts/nav-order-selftest.mjs",
+    "badge:selftest": "node scripts/badge-selftest.mjs",
     "test:smoke": "VITE_SUPABASE_URL= VITE_SUPABASE_ANON_KEY= vite build --outDir dist-smoke && node scripts/smoke-test.mjs dist-smoke demo",
     "test:mobile": "VITE_SUPABASE_URL= VITE_SUPABASE_ANON_KEY= vite build --outDir dist-smoke && node scripts/mobile-test.mjs dist-smoke"
   },

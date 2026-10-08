@@ -9,6 +9,8 @@
    - test      : → the caller's own devices; when the app names its own push address, only that one device, so
                  the answer describes the device the person is holding and not some other device of theirs
    Real notifications always go to every device of every recipient (office PC, laptop, Android, iPhone).
+   Every message carries that recipient's own app-icon badge number: how many requests are waiting for them,
+   counted from the committed state with the rule the app itself uses (_shared/next-step.js). 0 clears it.
    Subscriptions that the push service reports as gone (404, 410) are deleted.
 
    Deploy:  supabase functions deploy oe-push
@@ -17,6 +19,7 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { sendPush } from "../_shared/webpush.js";
 import { deviceResult, endpointTail, isGone, targetSubscriptions } from "../_shared/push-target.js";
+import { countNeedsAction, makeCan, visibleToUser } from "../_shared/next-step.js";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -27,6 +30,59 @@ const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
 
 const peso = (n: number) => "₱" + Number(n || 0).toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/* The number on each recipient's app icon: how many requests are waiting for THEM, right now.
+   Worked out from the committed state with the same rule the app uses (_shared/next-step.js), so the badge a
+   notification carries is the number the app shows when it is opened. Never derived by adjusting an earlier
+   number -- notify() runs after the change is committed, so one read of the current state is the truth.
+   Statuses nobody can act on (rejected, withdrawn) are left out: the rule counts them as nobody's work.
+   The same 5000 ceiling as the app's own load, so both sides count the same requests. */
+const ACTIONABLE = ["on_hold", "open", "disbursed", "paid", "closed"];
+const REQUEST_FIELDS =
+  "id, status, liaison_id, erp_ref, lines:oe_request_lines(status, amount, approved_amount, returned_amount, paid_amount, project_id, acct_verified_at, tm_verified_at, reclass:oe_line_reclass(amount))";
+
+// deno-lint-ignore no-explicit-any
+async function badgeCounts(admin: any, recipients: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (!recipients.length) return out;
+  const [people, roles, settingsRow, projects] = await Promise.all([
+    admin.from("oe_profiles").select("id, role").in("id", recipients),
+    admin.from("oe_role_permissions").select("role, permissions"),
+    admin.from("oe_settings").select("data").eq("id", 1).maybeSingle(),
+    admin.from("oe_projects").select("id, is_internal"),
+  ]);
+  // built with explicit loops: Map(array.map(...)) trips over tuple inference, and this file is only
+  // type-checked when it is deployed
+  const permsByRole = new Map<string, string[]>();
+  for (const r of (roles.data || []) as { role: string; permissions: string[] }[]) permsByRole.set(r.role, r.permissions);
+  const byProject = new Map<string, { is_internal: boolean }>();
+  for (const p of (projects.data || []) as { id: string; is_internal: boolean }[]) byProject.set(p.id, { is_internal: p.is_internal });
+  const idx = {
+    closePolicy: (settingsRow.data && settingsRow.data.data && settingsRow.data.data.close_policy) || "either",
+    projects: byProject,
+  };
+  const who = (people.data || []) as { id: string; role: string }[];
+  const cans = new Map<string, (p: string) => boolean>();
+  for (const p of who) cans.set(p.id, makeCan(p.role, permsByRole.get(p.role)));
+
+  // Someone whose role may see or approve every request needs the whole actionable set counted; someone who
+  // can only see their own needs just those. Mirrors the oe_requests read policy, so nobody's badge counts
+  // work they are not allowed to see.
+  const broad = who.some((p) => {
+    const can = cans.get(p.id)!;
+    return can("requests.view_all") || can("requests.approve");
+  });
+  let q = admin.from("oe_requests").select(REQUEST_FIELDS).in("status", ACTIONABLE);
+  if (!broad) q = q.in("liaison_id", recipients);
+  const { data: rows } = await q.order("created_at", { ascending: false }).limit(5000);
+
+  for (const p of who) {
+    const can = cans.get(p.id)!;
+    const me = { id: p.id, role: p.role };
+    out.set(p.id, countNeedsAction(visibleToUser(rows || [], me, can), me, can, idx));
+  }
+  return out;
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
@@ -87,8 +143,8 @@ Deno.serve(async (req) => {
       const approverRoles = new Set((roles || []).filter((x: { role: string; permissions: string[] }) => x.role === "admin" || (Array.isArray(x.permissions) && x.permissions.includes("requests.approve"))).map((x: { role: string }) => x.role));
       const { data: people } = await admin.from("oe_profiles").select("id, role").eq("is_active", true);
       recipients = (people || []).filter((p: { id: string; role: string }) => approverRoles.has(p.role) && p.id !== callerId).map((p: { id: string }) => p.id);
-      const { count } = await admin.from("oe_requests").select("id", { count: "exact", head: true }).eq("status", "on_hold");
-      payload = { title: "Request for approval", body: `${r.ref_no} from ${r.liaison_name}, ${peso(requested)}`, url: "/approvals", tag: `oe-req-${r.id}`, badge: count ?? undefined };
+      // the badge is added per recipient in step 3: their own count, not one number for everybody
+      payload = { title: "Request for approval", body: `${r.ref_no} from ${r.liaison_name}, ${peso(requested)}`, url: "/approvals", tag: `oe-req-${r.id}` };
     } else {
       const { data: mayApprove } = await asCaller.rpc("oe_has_perm", { p: "requests.approve" });
       if (mayApprove !== true) return json({ error: "Your role can't send this." }, 403);
@@ -105,10 +161,24 @@ Deno.serve(async (req) => {
   // 3. Send to every device of every recipient -- a person stays told on their office PC, their laptop and their
   //    phone at the same time. A device test names one address and goes only there. Devices the push service no
   //    longer knows (404, 410) are forgotten.
-  type Sub = { id: string; endpoint: string; p256dh: string; auth: string; device_id: string | null };
-  const { data: subs, error: sErr } = await admin.from("oe_push_subscriptions").select("id, endpoint, p256dh, auth, device_id").in("user_id", recipients);
+  type Sub = { id: string; user_id: string; endpoint: string; p256dh: string; auth: string; device_id: string | null };
+  const { data: subs, error: sErr } = await admin.from("oe_push_subscriptions").select("id, user_id, endpoint, p256dh, auth, device_id").in("user_id", recipients);
   if (sErr) return json({ error: sErr.message }, 500);
   const targets = targetSubscriptions((subs || []) as Sub[], testEndpoint) as Sub[];
+
+  // Each recipient's own badge number. Best effort: if this cannot be worked out the notification still goes,
+  // without a badge, and the app corrects the icon the next time it is opened. A wrong number would be worse
+  // than a stale one.
+  let badges = new Map<string, number>();
+  try {
+    badges = await badgeCounts(admin, recipients);
+  } catch (e) {
+    console.warn("oe-push badge", String(e && (e as Error).message));
+  }
+  const payloadFor = (userId: string) => {
+    const n = badges.get(userId);
+    return typeof n === "number" ? { ...payload, badge: n } : payload; // 0 tells the worker to clear it
+  };
   let sent = 0, failed = 0;
   const gone: string[] = [];
   // one line per device for the caller's console: which device, the push service and its answer; never the
@@ -118,7 +188,7 @@ Deno.serve(async (req) => {
       const service = new URL(s.endpoint).host;
       const device = endpointTail(s.endpoint);
       try {
-        const res = await sendPush(s, payload, vapid, { ttl: 24 * 3600, urgency: "high" });
+        const res = await sendPush(s, payloadFor(s.user_id), vapid, { ttl: 24 * 3600, urgency: "high" });
         const note = res.ok ? undefined : (await res.text()).slice(0, 160);
         if (res.ok) sent++;
         else if (isGone(res.status)) gone.push(s.id);
@@ -148,6 +218,7 @@ Deno.serve(async (req) => {
       event,
       scope: testEndpoint ? "device" : "all-devices",
       devices: (subs || []).length, // how many devices this person has registered in total
+      badge: badges.has(callerId) ? badges.get(callerId) : null, // what the app icon was set to
       recipients: recipients.length,
       sent,
       failed,

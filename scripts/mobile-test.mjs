@@ -145,8 +145,14 @@ for (const [w, h, name] of [
     if (r.left >= 0 && r.right <= r.vw) inView++;
   }
   check(na > 0 && inView === na, `${name} approvals: all ${na} approve-amount fields fit on screen`);
+  // Reject and Approve close the review in the page rather than floating over it, so they are reached by
+  // scrolling the drawer to the end -- which is what the drawer's subtitle tells the approver to do.
+  const bandPos = await pg.locator(".oe-approve-bar").evaluate((el) => getComputedStyle(el).position);
+  check(bandPos === "static", `${name} approvals: the Approve band sits in the page, not floating (position: ${bandPos})`);
+  await pg.locator(".oe-drawer-b").evaluate((el) => (el.scrollTop = el.scrollHeight));
+  await wait(pg);
   const ab = await rect(pg.locator(".oe-approve-bar button").last());
-  check(ab.bottom <= ab.vh + 1 && ab.top >= 0, `${name} approvals: Approve button in reach without scrolling`);
+  check(ab.bottom <= ab.vh + 1 && ab.top >= 0, `${name} approvals: Approve button in reach at the end of the review`);
   await pg.keyboard.press("Escape");
   await wait(pg, 400);
   check((await pg.locator("[role=dialog]").count()) === 0, `${name} approvals: the drawer closes and the queue is back`);
